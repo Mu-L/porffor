@@ -2961,8 +2961,8 @@ const generateAssign = (scope, decl, valueUnused = false) => {
 
     const hash = ctHash(decl.left);
 
-    // computed keys go through ToPropertyKey, static names already are keys
-    const keyOf = () => decl.left.computed ? builtinCall(scope, '__ecma262_ToPropertyKey', [ prop ]) : prop;
+    // compound ops reuse one converted key for their get + set
+    const keyOf = () => decl.left.computed && op !== '=' ? builtinCall(scope, '__ecma262_ToPropertyKey', [ prop ]) : prop;
     const setBuiltin = scope.strict ? '__Porffor_object_setStrict' : '__Porffor_object_set';
 
     if (globalThisName) {
@@ -4082,7 +4082,7 @@ const generateMember = (scope, decl, objValue = null) => {
   const hash = ctHash(decl);
 
   const genericMemberGet = () => {
-    const key = toPropertyKey(scope, prop, decl.computed);
+    const key = prop[N_TYPE] === T.jsval ? prop : valNumber(prop);
     if (hash == null) return builtinCall(scope, '__Porffor_object_get', [ obj, key ]);
 
     if (Prefs.ic && (known == null || known === TYPES.object)) {
