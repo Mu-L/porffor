@@ -4099,10 +4099,13 @@ const generateMember = (scope, decl, objValue = null) => {
   };
 
   const genericMemberGetBC = [
-    [ TYPES.undefined, () => internalThrow(scope, 'TypeError', propertyErrorMessage('read', 'undefined', decl)) ],
     ...extraBC,
     [ 'default', () => genericMemberGet() ]
   ];
+
+  // -d: undefined errors include the property name
+  if (Prefs.d)
+    genericMemberGetBC.unshift([ TYPES.undefined, () => internalThrow(scope, 'TypeError', propertyErrorMessage('read', 'undefined', decl)) ]);
 
   const lengthMemberGet = () => {
     const lengthVal = () => Box(Convert(T.f64, LenGet(JvPtr(obj))), Const(T.i32, TYPES.number));
