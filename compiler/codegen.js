@@ -5154,6 +5154,7 @@ export default (program, opts = {}) => {
     if (irFinalizers.length === beforeFinalizers && funcs.length === beforeFuncs && usedTypes.size === beforeTypes) break;
     if (pass === 15) throw new Error('IR finalizers did not converge');
   }
+  irFinalizers.length = 0;
 
   if (builtinGlobalInits.length !== 0) topLevelFunc.body.unshift(...builtinGlobalInits);
 
