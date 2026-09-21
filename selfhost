@@ -35,7 +35,7 @@ const parityCases = [
   [ 'regex', 'bench/regex.js', null, { compareNativeOutput: false } ],
   [ 'temporal', temporalFile, () => fs.writeFileSync(temporalFile, 'Temporal;\n'), { compareNativeOutput: false } ],
 ];
-const detailBenchCases = [ 'v8_v7', 'richards', 'regex', 'temporal', 'selfhost' ];
+const detailBenchCases = [ 'v8_v7', 'richards', 'regex', 'temporal', 'selfhost', 'tsc' ];
 
 const color = process.stdout.isTTY && !process.env.NO_COLOR;
 const ansi = code => color ? `\x1b[${code}m` : '';
@@ -1066,7 +1066,8 @@ const bench = async opts => {
 
   const verifyCases = [
     ...parityCases,
-    [ 'selfhost', bundle ]
+    [ 'selfhost', bundle ],
+    [ 'tsc', 'exp/tsc/out/release/bundle.js' ]
   ];
   const benchCases = verifyCases.filter(([ name ]) =>
     !opts.skip.includes(name) && (!opts.detail || detailBenchCases.includes(name)));
