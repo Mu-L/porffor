@@ -322,6 +322,8 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
   // labels are only emitted when goto'd
   const loopStack = [];
   const breakStack = [];
+  // try depth at each label so a break or continue leaving a try body can unwind porf_try_depth
+  const labelTry = new Map();
   let activeTryDepth = 0;
   let usedLabels = new Set();
 
@@ -609,6 +611,7 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
         else emit(`${ind()}while (1) {\n`);
         loopStack.push(label);
         breakStack.push(label);
+        if (label) labelTry.set(label, activeTryDepth);
         depth++;
         renderStmts(stmts);
         if (label && usedLabels.has(label + '_c')) emit(`${ind()}${sanitize(label)}_c:;\n`);
@@ -620,22 +623,29 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
         return;
       }
 
-      case K.Break:
+      case K.Break: {
+        const target = labelTry.get(node[N_A]);
+        if (activeTryDepth > target) emit(`${ind()}porf_try_depth -= ${activeTryDepth - target};\n`);
         if (node[N_A] && node[N_A] !== breakStack[breakStack.length - 1]) {
           usedLabels.add(node[N_A] + '_b');
           emit(`${ind()}goto ${sanitize(node[N_A])}_b;\n`);
         } else emit(`${ind()}break;\n`);
         return;
+      }
 
-      case K.Continue:
+      case K.Continue: {
+        const target = labelTry.get(node[N_A]);
+        if (activeTryDepth > target) emit(`${ind()}porf_try_depth -= ${activeTryDepth - target};\n`);
         if (node[N_A] && node[N_A] !== loopStack[loopStack.length - 1]) {
           usedLabels.add(node[N_A] + '_c');
           emit(`${ind()}goto ${sanitize(node[N_A])}_c;\n`);
         } else emit(`${ind()}continue;\n`);
         return;
+      }
 
       case K.Block: {
         if (node[N_A].length === 0 && !node[N_B]) return;
+        if (node[N_B]) labelTry.set(node[N_B], activeTryDepth);
         emit(`${ind()}{\n`);
         depth++; renderStmts(node[N_A]); depth--;
         emit(`${ind()}}\n`);

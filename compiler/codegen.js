@@ -898,6 +898,18 @@ const generateYield = (scope, decl) => {
 const generateReturn = (scope, decl) => {
   const arg = decl.argument ?? DEFAULT_VALUE;
 
+  // inside try/catch with a finally: park the value and let the finalizer complete the return
+  const fin = scope.finallyStack?.[scope.finallyStack.length - 1];
+  if (fin) {
+    if (scope.retType === T.none) {
+      if (arg.type !== 'Identifier') exprStmt(scope, generate(scope, arg));
+    } else {
+      assign(scope, Local(fin.val, T.jsval), coerceValue(generate(scope, arg), T.jsval));
+    }
+    finallyExit(scope, fin, FIN_RETURN);
+    return;
+  }
+
   // void IR retType (distinct from porffor returnType): evaluate arg for effects only
   if (scope.retType === T.none) {
     if (arg.type !== 'Identifier') exprStmt(scope, generate(scope, arg));
@@ -3719,12 +3731,22 @@ const consumePendingLabels = (scope, d) => {
 
 const generateBreak = (scope, decl) => {
   const target = decl.label ? scope.labels.get(decl.label.name) : getNearestLoop();
+  const fin = finallyCrossing(scope, target);
+  if (fin) {
+    finallyExit(scope, fin, fin.exits.push(() => generateBreak(scope, decl)));
+    return valUndefined();
+  }
   stmt(scope, Break(target.brk));
   return valUndefined();
 };
 
 const generateContinue = (scope, decl) => {
   const target = decl.label ? scope.labels.get(decl.label.name) : getNearestLoop(LOOP_TYPES);
+  const fin = finallyCrossing(scope, target);
+  if (fin) {
+    finallyExit(scope, fin, fin.exits.push(() => generateContinue(scope, decl)));
+    return valUndefined();
+  }
   stmt(scope, target.contViaBreak ? Break(target.cont) : Continue(target.cont));
   return valUndefined();
 };
@@ -3768,32 +3790,66 @@ const generateThrow = (scope, decl) => {
   stmt(scope, Throw(generate(scope, decl.argument)));
 };
 
+// exits inside a try with a finalizer record themselves in #fin_pend and jump to the finalizer, which then completes them
+// #fin_pend is 0 for normal completion, else 1 + index into fin.exits
+const FIN_THROW = 1, FIN_RETURN = 2;
+const finallyCrossing = (scope, target) => {
+  const fin = scope.finallyStack?.[scope.finallyStack.length - 1];
+  return fin && depth.indexOf(target) < fin.depthIndex ? fin : null;
+};
+const finallyExit = (scope, fin, kind) => {
+  assign(scope, Local(fin.pend, T.i32), Const(T.i32, kind));
+  stmt(scope, Break(fin.brk));
+};
+
 const generateTry = (scope, decl) => {
-  // todo: handle control-flow pre-exit for finally
-  // "Immediately before a control-flow statement (return, throw, break, continue) is executed in the try block or catch block."
-  // as in the old backend, break/continue/return out of the try/catch - and an uncaught
-  // throw (no handler, or a rethrow from catch) - bypass the finalizer.
-
-  const fin = decl.finalizer ? collect(scope, () => genStmt(scope, decl.finalizer)) : null;
-
-  const tryBody = collect(scope, () => genStmt(scope, decl.block));
-
   const tmpName = '#catch_tmp' + (scope.catchId = (scope.catchId ?? 0) + 1);
   allocVar(scope, tmpName);
 
+  let fin = null;
+  if (decl.finalizer) {
+    const id = scope.catchId;
+    fin = { brk: fresh(scope), pend: '#fin_pend' + id, val: '#fin_val' + id, depthIndex: depth.length };
+    fin.exits = [
+      () => stmt(scope, Throw(Local(fin.val, T.jsval))),
+      () => generateReturn(scope, { type: 'ReturnStatement', argument: scope.retType === T.none ? null : identNode(fin.val) })
+    ];
+    allocVar(scope, fin.pend, false, T.i32);
+    allocVar(scope, fin.val);
+    assign(scope, Local(fin.pend, T.i32), Const(T.i32, 0));
+    (scope.finallyStack ??= []).push(fin);
+  }
+
+  const tryBody = collect(scope, () => genStmt(scope, decl.block));
+
+  let protectedStmts;
   if (decl.handler) {
     const param = decl.handler.param;
     const catchBody = collect(scope, () => {
       if (param) generateVarDstr(scope, 'let', param, { type: 'Identifier', name: tmpName }, undefined, false);
       genStmt(scope, decl.handler.body);
     });
+    protectedStmts = [ Try(tryBody, tmpName, catchBody) ];
+  } else protectedStmts = tryBody;
 
-    stmt(scope, Try(tryBody, tmpName, catchBody));
-  } else {
-    stmt(scope, Try(tryBody, tmpName, [ Throw(Local(tmpName, T.jsval)) ]));
+  if (!fin) {
+    for (const s of protectedStmts) stmt(scope, s);
+    return;
   }
 
-  if (fin) for (const s of fin) stmt(scope, s);
+  scope.finallyStack.pop();
+
+  // anything thrown out of the protected region is held while the finalizer runs
+  const catchAll = collect(scope, () => {
+    assign(scope, Local(fin.val, T.jsval), Local(tmpName, T.jsval));
+    assign(scope, Local(fin.pend, T.i32), Const(T.i32, FIN_THROW));
+  });
+  stmt(scope, BlockStmt([ Try(protectedStmts, tmpName, catchAll) ], fin.brk));
+
+  genStmt(scope, decl.finalizer);
+
+  let code = 1;
+  for (const exit of fin.exits) emitIf(scope, Bin('==', T.i32, Local(fin.pend, T.i32), Const(T.i32, code++)), exit);
 };
 
 const generateMeta = (scope, decl) => {
