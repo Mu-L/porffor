@@ -2193,7 +2193,11 @@ const typeSwitch = (scope, subject, staticType, bc, fallthrough = false) => {
   // the pool so branch scratch cannot clobber them
   const pinned = scope.tmpBusy.slice();
   const chainLabel = scope.chainLabel, chainRes = scope.chainRes;
+  let lastTypes = -1;
   const finalize = () => {
+    if (lastTypes === usedTypes.size) return;
+    lastTypes = usedTypes.size;
+
     const prevLabel = scope.chainLabel, prevRes = scope.chainRes;
     scope.chainLabel = chainLabel;
     scope.chainRes = chainRes;
