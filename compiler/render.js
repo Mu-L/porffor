@@ -38,7 +38,7 @@ const cReservedNames = new Set([
   'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline', 'int', 'long',
   'register', 'restrict', 'return', 'short', 'signed', 'sizeof', 'static', 'struct',
   'switch', 'typedef', 'union', 'unsigned', 'void', 'volatile', 'while',
-  'asm', 'typeof', 'main',
+  'asm', 'typeof', 'main', '_return',
   'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'f32', 'f64', 'jsval',
   'NULL', 'NAN', 'INFINITY',
   'stdin', 'stdout', 'stderr', 'FILE', 'EOF',
@@ -704,6 +704,16 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
       }
 
       case K.Return:
+        if (activeTryDepth !== 0 && node[N_A]) {
+          emit(`${ind()}{\n`);
+          depth++;
+          emit(`${ind()}${CT[node[N_A][N_TYPE]]} _return = ${rx(node[N_A], P_COMMA)};\n`);
+          emit(`${ind()}porf_try_depth -= ${activeTryDepth};\n`);
+          emit(`${ind()}return _return;\n`);
+          depth--;
+          emit(`${ind()}}\n`);
+          return;
+        }
         if (activeTryDepth !== 0) emit(`${ind()}porf_try_depth -= ${activeTryDepth};\n`);
         emit(node[N_A] ? `${ind()}return ${rx(node[N_A], P_COMMA)};\n` : `${ind()}return;\n`);
         return;
