@@ -1,6 +1,6 @@
 import * as PrecompiledBuiltins from './builtins_precompiled.js';
 import { TYPES, TYPE_NAMES } from './types.js';
-import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, DeclLocal, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
+import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
 import './prefs.js';
 
 const f64FromBytes = bytes => {
@@ -50,6 +50,8 @@ export const BuiltinVars = ({ builtinFuncs }) => {
       ]
     } : {
       params: [],
+      localNames: [ 'obj' ],
+      localTypes: [ T.jsval ],
       retType: T.ptr,
       returnType: TYPES.object,
       body: ({ includeBuiltin, funcRefPtr, global, makeString, globalThisUserSync, onFinalize, hasFunc }) => {
@@ -66,7 +68,7 @@ export const BuiltinVars = ({ builtinFuncs }) => {
 
         const out = [
           If(getPtr, [ BlockStmt(sync), Return(getPtr) ]),
-          DeclLocal(T.jsval, 'obj', Call('__Porffor_object_new', [ Const(T.i32, Object.keys(props).length) ])),
+          Assign(obj, Call('__Porffor_object_new', [ Const(T.i32, Object.keys(props).length) ])),
           Assign(getPtr, JvPtr(obj))
         ];
 
@@ -437,10 +439,12 @@ export const BuiltinFuncs = () => {
   const nativeMathUnary = name => {
     _[`__Math_${name}`] = {
       params: [ { name: 'x', type: T.jsval } ],
+      localNames: [ 'n' ],
+      localTypes: [ T.f64 ],
       retType: T.jsval,
       returnType: TYPES.number,
       body: [
-        DeclLocal(T.f64, 'n', nativeMathArg('x')),
+        Assign(Local('n', T.f64), nativeMathArg('x')),
         RawC(`return porf_box_num(${name}(n));`, false)
       ]
     };
@@ -454,11 +458,13 @@ export const BuiltinFuncs = () => {
 
   _.__Math_atan2 = {
     params: [ { name: 'y', type: T.jsval }, { name: 'x', type: T.jsval } ],
+    localNames: [ 'yNum', 'xNum' ],
+    localTypes: [ T.f64, T.f64 ],
     retType: T.jsval,
     returnType: TYPES.number,
     body: [
-      DeclLocal(T.f64, 'yNum', nativeMathArg('y')),
-      DeclLocal(T.f64, 'xNum', nativeMathArg('x')),
+      Assign(Local('yNum', T.f64), nativeMathArg('y')),
+      Assign(Local('xNum', T.f64), nativeMathArg('x')),
       RawC('return porf_box_num(atan2(yNum, xNum));', false)
     ]
   };
@@ -466,11 +472,13 @@ export const BuiltinFuncs = () => {
   // C pow() returns 1 where JS requires NaN
   _.__Math_pow = {
     params: [ { name: 'base', type: T.jsval }, { name: 'exponent', type: T.jsval } ],
+    localNames: [ 'baseNum', 'exponentNum' ],
+    localTypes: [ T.f64, T.f64 ],
     retType: T.jsval,
     returnType: TYPES.number,
     body: [
-      DeclLocal(T.f64, 'baseNum', nativeMathArg('base')),
-      DeclLocal(T.f64, 'exponentNum', nativeMathArg('exponent')),
+      Assign(Local('baseNum', T.f64), nativeMathArg('base')),
+      Assign(Local('exponentNum', T.f64), nativeMathArg('exponent')),
       RawC(`if (exponentNum != exponentNum) return porf_box_num(NAN);
 if ((baseNum == 1.0 || baseNum == -1.0) && isinf(exponentNum)) return porf_box_num(NAN);
 return porf_box_num(pow(baseNum, exponentNum));`, false)
@@ -486,10 +494,12 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
   ]) {
    _[`__Math_${name}`] = {
       params: [ { name: 'x', type: T.jsval } ],
+      localNames: [ 'n' ],
+      localTypes: [ T.f64 ],
       retType: T.jsval,
       returnType: TYPES.number,
       body: [
-        DeclLocal(T.f64, 'n', nativeMathArg('x')),
+        Assign(Local('n', T.f64), nativeMathArg('x')),
         Return(Box(Un(op, T.f64, Local('n', T.f64)), Const(T.i32, TYPES.number)))
       ]
     };
@@ -497,10 +507,12 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
 
   _.__Math_sign = {
     params: [ { name: 'x', type: T.jsval } ],
+    localNames: [ 'n' ],
+    localTypes: [ T.f64 ],
     retType: T.jsval,
     returnType: TYPES.number,
     body: [
-      DeclLocal(T.f64, 'n', nativeMathArg('x')),
+      Assign(Local('n', T.f64), nativeMathArg('x')),
       RawC('if (n != n || n == 0.0) return porf_box_num(n);\nreturn porf_box_num(copysign(1.0, n));', false)
     ]
   };
@@ -508,31 +520,37 @@ return porf_box_num(pow(baseNum, exponentNum));`, false)
   // todo: does not follow spec with +-Infinity and values >2**32
   _.__Math_clz32 = {
     params: [ { name: 'x', type: T.jsval } ],
+    localNames: [ 'n' ],
+    localTypes: [ T.f64 ],
     retType: T.jsval,
     returnType: TYPES.number,
     body: [
-      DeclLocal(T.f64, 'n', nativeMathArg('x')),
+      Assign(Local('n', T.f64), nativeMathArg('x')),
       RawC('return porf_box_num((f64)porf_clz32(porf_f64_to_u32(n)));', false)
     ]
   };
 
   _.__Math_fround = {
     params: [ { name: 'x', type: T.jsval } ],
+    localNames: [ 'n' ],
+    localTypes: [ T.f64 ],
     retType: T.jsval,
     returnType: TYPES.number,
     body: [
-      DeclLocal(T.f64, 'n', nativeMathArg('x')),
+      Assign(Local('n', T.f64), nativeMathArg('x')),
       RawC('return porf_box_num((f64)(f32)n);', false)
     ]
   };
 
   _.__Math_imul = {
     params: [ { name: 'x', type: T.jsval }, { name: 'y', type: T.jsval } ],
+    localNames: [ 'xNum', 'yNum' ],
+    localTypes: [ T.f64, T.f64 ],
     retType: T.jsval,
     returnType: TYPES.number,
     body: [
-      DeclLocal(T.f64, 'xNum', nativeMathArg('x')),
-      DeclLocal(T.f64, 'yNum', nativeMathArg('y')),
+      Assign(Local('xNum', T.f64), nativeMathArg('x')),
+      Assign(Local('yNum', T.f64), nativeMathArg('y')),
       RawC(`f64 xd = trunc(xNum);
 xd -= floor(xd / 4294967296.0) * 4294967296.0;
 if (xd < 0.0) xd += 4294967296.0;
@@ -545,6 +563,8 @@ return porf_box_num((f64)(i32)((u32)xd * (u32)yd));`, false)
 
   _.__Porffor_prng = {
     params: [],
+    localNames: [ 's1', 's0', 'result' ],
+    localTypes: [ T.u64, T.u64, T.u64 ],
     retType: T.u64,
     body: ({ global }) => {
       const state0 = global('state0', T.u64);
@@ -558,9 +578,9 @@ return porf_box_num((f64)(i32)((u32)xd * (u32)yd));`, false)
           Assign(state0, Const(T.u64, 0x7b1dcdaf)),
           Assign(state1, Const(T.u64, 0x21b965f5))
         ]),
-        DeclLocal(T.u64, 's1', state1),
-        DeclLocal(T.u64, 's0', state0),
-        DeclLocal(T.u64, 'result', Bin('+', T.u64, s0, s1)),
+        Assign(s1, state1),
+        Assign(s0, state0),
+        Assign(result, Bin('+', T.u64, s0, s1)),
         Assign(s1, Bin('^', T.u64, s1, s0)),
         Assign(state0, Bin('^', T.u64,
           Bin('^', T.u64, Bin('rotl', T.u64, s0, Const(T.u64, 24)), s1),

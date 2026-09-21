@@ -560,13 +560,6 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
   const renderStmt = node => {
     if (node == null) return;
     switch (node[N_KIND]) {
-      case K.DeclLocal: {
-        // locals hoist to function top, in-place DeclLocal becomes assignment
-        const init = node[N_B];
-        if (init) emit(`${ind()}${sanitize(node[N_A])} = ${rx(init, P_COMMA)};\n`);
-        return;
-      }
-
       case K.Assign:
         emit(`${ind()}${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
         return;
@@ -787,30 +780,12 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
     loopStack.length = 0;
     usedLabels = new Set();
     if (needsCoro(f)) emit(`  porf_coro_prologue();\n`);
-    // declare every function-scoped local at the top (params come from the signature),
-    // f.locals has them all, DeclLocal nodes additionally carry in-place initialisers
-    const declared = new Set();
-    if (f.params) for (const p of f.params) declared.add(p.name);
-    if (f.locals) for (const name in f.locals) {
-      if (declared.has(name)) continue;
-      declared.add(name);
+    const paramNames = new Set(f.params.map(p => p.name));
+    for (const name in f.locals) {
+      if (paramNames.has(name)) continue;
       const t = f.locals[name].type;
       emit(`  ${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     }
-    // catch DeclLocal-only locals missing from f.locals
-    const hoistDecls = node => {
-      if (!Array.isArray(node)) return;
-      if (typeof node[0] === 'number' && KNames[node[0]] !== undefined && node.length === 6) {
-        if (node[N_KIND] === K.DeclLocal && !declared.has(node[N_A])) {
-          declared.add(node[N_A]);
-          emit(`  ${CT[node[N_C]]} ${sanitize(node[N_A])}${node[N_C] === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
-        }
-        hoistDecls(node[N_A]); hoistDecls(node[N_B]); hoistDecls(node[N_C]);
-        return;
-      }
-      for (const x of node) hoistDecls(x);
-    };
-    hoistDecls(f.body);
     renderStmts(f.body);
     emit(`}\n\n`);
   };

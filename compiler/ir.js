@@ -44,7 +44,6 @@ export const K = {
   // variables
   Local: k++,    // a: name (string)
   Global: k++,   // a: name
-  DeclLocal: k++,// a: name, b: init expr|null   (type = local's type)
   Assign: k++,   // a: Local/Global node, b: value expr
 
   // arithmetic / compare / bits - op strings are C operators
@@ -142,8 +141,6 @@ export const DataRef = segId => [K.DataRef, T.ptr, FX.none, segId, 0, 0];
 
 export const Local = (name, type) => [K.Local, type, FX.none, name, 0, 0];
 export const Global = (name, type) => [K.Global, type, FX.readGlobal, name, 0, 0];
-export const DeclLocal = (type, name, init = null) =>
-  [K.DeclLocal, T.none, FX.writeLocal | (init ? fxOf(init) : 0), name, init, type];
 export const Assign = (target, value) =>
   [K.Assign, T.none, FX.writeLocal | fxOf(target) | fxOf(value) | (target[N_KIND] === K.Global ? FX.readGlobal : 0), target, value, 0];
 
