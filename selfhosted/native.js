@@ -322,6 +322,7 @@ const statSync = path => {
   const pathType = Porffor.type(path);
   let size = -1;
   let isDir = 0;
+  let isFile = 0;
   Porffor.c`
 char *path_owned;
 char *path_ptr = __porffor_node_cstr(MEM, path, (i32)pathType.val, &path_owned);
@@ -329,12 +330,14 @@ struct stat st;
 if (stat(path_ptr, &st) == 0) {
   size = st.st_size;
   isDir = S_ISDIR(st.st_mode) ? 1 : 0;
+  isFile = S_ISREG(st.st_mode) ? 1 : 0;
 }
 if (path_owned) free(path_owned);
 `;
   if (size < 0) throw new Error('statSync failed');
   const dir = isDir != 0;
-  return { size, isDirectory: () => dir };
+  const file = isFile != 0;
+  return { size, isDirectory: () => dir, isFile: () => file };
 };
 
 const existsSync = path => {
