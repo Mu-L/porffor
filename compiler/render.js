@@ -4261,6 +4261,7 @@ static _Thread_local NativeFetchResponseParts* porf_native_fetch_response_parts_
 ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define MEM porf_mem
 #define PORF_NOINLINE __attribute__((noinline))
+#define PORF_NORETURN __attribute__((cold, noinline, noreturn))
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
 #endif
@@ -4542,10 +4543,7 @@ ${sti}jmp_buf* porf_try_ensure(void) {
 `}\
 ${toStr ? `jsval ${toStr}(jsval);
 ` : ''}\
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((cold, noinline, noreturn))
-#endif
-${st}void porf_throw(jsval v) {
+PORF_NORETURN ${st}void porf_throw(jsval v) {
   porf_exception = v;
   if (porf_try_depth > 0) _longjmp(porf_try_stack[porf_try_depth - 1], 1);
 ${toStr ? `
@@ -4572,19 +4570,13 @@ ${toStr ? `
 // internal throws construct a standard error (message jsval at +0, like the error
 // builtins) so a caught internal error behaves identically to a \`new X(msg)\` one
 ${sti}u32 porf_alloc(u32 bytes, u32 typeId);
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((cold, noinline, noreturn))
-#endif
-${st}void porf_throw_new(i32 errType, u32 msgId) {
+PORF_NORETURN ${st}void porf_throw_new(i32 errType, u32 msgId) {
   const u32 p = porf_alloc(8, (u32)errType);
   *(jsbits*)(MEM + p) = JV_PATTERN | ((u64)${TYPES.bytestring} << 43) | msgId;
   porf_throw(porf_box((f64)p, errType));
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((cold, noinline, noreturn))
-#endif
-${st}void porf_unreachable(const char* msg) {
+PORF_NORETURN ${st}void porf_unreachable(const char* msg) {
   fprintf(stderr, "porffor: unreachable%s%s\\n", msg ? ": " : "", msg ? msg : "");
   abort();
 }
