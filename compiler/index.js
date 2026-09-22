@@ -222,7 +222,7 @@ export default (code, module = Prefs.module) => {
     if (logProgress) {
       const total = performance.now();
       progressClear();
-      console.log(`\u001b[2m[${formatTime(total)}]\u001b[0m \u001b[32mcompiled ${globalThis.file} \u001b[90m->\u001b[0m \u001b[92m${outFile}\u001b[90m (${formatSize(fs.statSync(outFile).size)})\u001b[0m`);
+      if (!Prefs.run) console.log(`\u001b[2m[${formatTime(total)}]\u001b[0m \u001b[32mcompiled ${globalThis.file} \u001b[90m->\u001b[0m \u001b[92m${outFile}\u001b[90m (${formatSize(fs.statSync(outFile).size)})\u001b[0m`);
     }
 
     return;

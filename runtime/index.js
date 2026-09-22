@@ -107,7 +107,8 @@ entrypoint: {
     if (Prefs.o == null) {
       tmpRunDir = fs.mkdtempSync('/tmp/porffor-run-');
       Prefs.o = `${tmpRunDir}/out`;
-      Prefs.quiet = true;
+      Prefs.quiet = !process.stdout.isTTY;
+      Prefs.run = true;
       runAfterCompile = true;
     }
   }
