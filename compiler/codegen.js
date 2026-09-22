@@ -2612,6 +2612,9 @@ const generateVarDstr = (scope, kind, pattern, init, defaultValue, global) => {
         else if (st == null) emitIf(scope, Bin('==', T.jsval, ref, valUndefined()), doDefault);
       }
     } else {
+      // a let is undefined at its declaration, again on every loop iteration
+      const ref = global ? Global(name, globals[name]?.type ?? T.jsval) : Local(name, scope.locals[name]?.type ?? T.jsval);
+      if (kind === 'let' && !typed && ref[N_TYPE] === T.jsval) assign(scope, ref, valUndefined());
       setInferred(scope, name, null, global);
     }
 
