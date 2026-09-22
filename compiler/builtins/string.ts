@@ -887,38 +887,44 @@ export const __Porffor_string_substringToBest = (str: string, start: number, end
   return out;
 };
 
-export const __String_prototype_substring = function (this: string, start: number, end: number) {
+export const __String_prototype_substring = function (this: string, _start: any, _end: any) {
   const len: i32 = this.length;
-  if (Porffor.type(end) == Porffor.TYPES.undefined) {
-    end = len;
-  } else if (start > end) {
-    const tmp: i32 = end;
-    end = start;
-    start = tmp;
-  }
+  if (Porffor.type(_end) == Porffor.TYPES.undefined) _end = len;
+
+  let start: number = ecma262.ToIntegerOrInfinity(_start);
+  let end: number = ecma262.ToIntegerOrInfinity(_end);
 
   if (start < 0) start = 0;
   if (start > len) start = len;
   if (end < 0) end = 0;
   if (end > len) end = len;
+
+  if (start > end) {
+    const tmp: i32 = end;
+    end = start;
+    start = tmp;
+  }
 
   return __Porffor_string_substringToBest(this, start, end);
 };
 
-export const __ByteString_prototype_substring = function (this: bytestring, start: number, end: number) {
+export const __ByteString_prototype_substring = function (this: bytestring, _start: any, _end: any) {
   const len: i32 = this.length;
-  if (Porffor.type(end) == Porffor.TYPES.undefined) {
-    end = len;
-  } else if (start > end) {
-    const tmp: i32 = end;
-    end = start;
-    start = tmp;
-  }
+  if (Porffor.type(_end) == Porffor.TYPES.undefined) _end = len;
+
+  let start: number = ecma262.ToIntegerOrInfinity(_start);
+  let end: number = ecma262.ToIntegerOrInfinity(_end);
 
   if (start < 0) start = 0;
   if (start > len) start = len;
   if (end < 0) end = 0;
   if (end > len) end = len;
+
+  if (start > end) {
+    const tmp: i32 = end;
+    end = start;
+    start = tmp;
+  }
 
   const outLen: i32 = end - start;
   const out: bytestring = Porffor.malloc(6 + outLen);
@@ -929,27 +935,33 @@ export const __ByteString_prototype_substring = function (this: bytestring, star
 };
 
 
-export const __String_prototype_substr = function (this: string, start: number, length: number) {
+export const __String_prototype_substr = function (this: string, _start: any, _length: any) {
   const len: i32 = this.length;
+  let start: number = ecma262.ToIntegerOrInfinity(_start);
   if (start < 0) {
     start = len + start;
     if (start < 0) start = 0;
   }
 
-  if (Porffor.type(length) == Porffor.TYPES.undefined) length = len - start;
+  if (Porffor.type(_length) == Porffor.TYPES.undefined) _length = len - start;
+
+  let length: number = ecma262.ToIntegerOrInfinity(_length);
   if (start + length > len) length = len - start;
 
   return __Porffor_string_substringToBest(this, start, start + length);
 };
 
-export const __ByteString_prototype_substr = function (this: bytestring, start: number, length: number) {
+export const __ByteString_prototype_substr = function (this: bytestring, _start: any, _length: any) {
   const len: i32 = this.length;
+  let start: number = ecma262.ToIntegerOrInfinity(_start);
   if (start < 0) {
     start = len + start;
     if (start < 0) start = 0;
   }
 
-  if (Porffor.type(length) == Porffor.TYPES.undefined) length = len - start;
+  if (Porffor.type(_length) == Porffor.TYPES.undefined) _length = len - start;
+
+  let length: number = ecma262.ToIntegerOrInfinity(_length);
   if (start + length > len) length = len - start;
 
   const out: bytestring = Porffor.malloc(6 + length);
