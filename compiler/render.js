@@ -3438,10 +3438,9 @@ static void porf_gc_discard_free_runs(void) {
 static void porf_gc_maybe_trim_memory(void) {
   const u32 trim_granule = 1u << 20;
   const u32 keep_slack = ${prefs.nativeFetch ? '0u' : '16u * 1024u * 1024u'};
-  const u32 min_trim = ${prefs.nativeFetch ? '1u << 20' : '16u * 1024u * 1024u'};
 
   u64 wanted64 = ((u64)porf_heap_top + keep_slack + trim_granule - 1ull) & ~((u64)trim_granule - 1ull);
-  const u64 min_committed = (u64)porf_heap_base + 65536ull;
+  const u64 min_committed = ((u64)porf_heap_base + 65536ull + trim_granule - 1ull) & ~((u64)trim_granule - 1ull);
   if (wanted64 < min_committed) wanted64 = min_committed;
   if (wanted64 >= porf_heap_committed) return;
 
@@ -3449,7 +3448,7 @@ static void porf_gc_maybe_trim_memory(void) {
   const u64 trim_bytes64 = porf_heap_committed - wanted64;
   if (trim_bytes64 > SIZE_MAX) return;
   const size_t trim_bytes = (size_t)trim_bytes64;
-  if (trim_bytes < min_trim) return;
+  if (trim_bytes < trim_granule) return;
 
   if (!PORF_CAN_DECOMMIT) return;
   // replacing the tail drops its pages but keeps the reservation
