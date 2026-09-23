@@ -3452,8 +3452,8 @@ static void porf_gc_maybe_trim_memory(void) {
   if (trim_bytes < min_trim) return;
 
   if (!PORF_CAN_DECOMMIT) return;
-  porf_gc_madv_dontneed(wanted, trim_bytes);
-  if (mprotect(MEM + wanted, trim_bytes, PROT_NONE) != 0) return;
+  // replacing the tail drops its pages but keeps the reservation
+  if (mmap(MEM + wanted, trim_bytes, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) return;
   porf_heap_committed = wanted;
 }
 
