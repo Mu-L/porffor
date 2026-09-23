@@ -2527,7 +2527,7 @@ static i32 porf_gc_native_root_active_len = 0;
 ${usesThreads ? 'static pthread_mutex_t porf_gc_native_root_lock = PTHREAD_MUTEX_INITIALIZER;\n' : ''}
 i32 porf_gc_native_root_add(f64 value, i32 type) {
 ${usesThreads ? '  pthread_mutex_lock(&porf_gc_native_root_lock);\n' : ''}\
-  if (porf_gc_native_roots_len == porf_gc_native_roots_cap) {
+  if (porf_gc_native_root_free_slots_len == 0 && porf_gc_native_roots_len == porf_gc_native_roots_cap) {
     i32 new_cap = porf_gc_native_roots_cap == 0 ? 64 : porf_gc_native_roots_cap * 2;
     struct porf_gc_native_root* grown = realloc(porf_gc_native_roots, (size_t)new_cap * sizeof(*grown));
     i32* grown_free_slots = realloc(porf_gc_native_root_free_slots, (size_t)new_cap * sizeof(*grown_free_slots));
