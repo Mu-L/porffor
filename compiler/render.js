@@ -2857,6 +2857,8 @@ static void porf_gc_mark_js(f64 value, i32 type) {
   }
   const i32 body = porf_gc_value_body(value, type);
   if (body == 0) return;
+  // static strings hold no references and are never freed
+  if ((u32)body < PORF_STATIC_END && (type == ${TYPES.bytestring} || type == ${TYPES.string})) return;
   if (porf_gc_is_block_start(body)) {
     if (type == ${TYPES.object} && !porf_gc_object_shape_valid(body)) return;
     if (!porf_gc_mark_body(body)) {
