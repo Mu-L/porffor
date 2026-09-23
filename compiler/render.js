@@ -1808,7 +1808,7 @@ static void porf_commit(u64 end) {
     fprintf(stderr, "porffor: out of memory (commit %llu)\\n", (unsigned long long)want);
     exit(1);
   }
-  if (PORF_CAN_DECOMMIT && mprotect(MEM, (size_t)want, PROT_READ | PROT_WRITE) != 0) {
+  if (PORF_CAN_DECOMMIT && mprotect(MEM + porf_heap_committed, (size_t)(want - porf_heap_committed), PROT_READ | PROT_WRITE) != 0) {
     fprintf(stderr, "porffor: out of memory (commit %llu)\\n", (unsigned long long)want);
     exit(1);
   }
