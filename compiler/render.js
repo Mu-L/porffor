@@ -2931,7 +2931,8 @@ static void porf_gc_scan_object_entries_range(i32 entries, u32 from, u32 to) {
   for (u32 i = from; i < to; i++) {
     const i32 entry = entries + (i32)(i * 20u);
     const i32 key_type = *(u8*)(MEM + entry + 18);
-    if (porf_gc_type_can_reference(key_type)) porf_gc_mark_js((f64)(*(u32*)(MEM + entry + 4)), key_type);
+    const u32 key = *(u32*)(MEM + entry + 4);
+    if (key >= PORF_STATIC_END && porf_gc_type_can_reference(key_type)) porf_gc_mark_js((f64)key, key_type);
     const u8 flags = *(u8*)(MEM + entry + 16);
     if ((flags & 1u) != 0u) {
       const u32 get = *(u32*)(MEM + entry + 8);
