@@ -4113,7 +4113,6 @@ const generateMember = (scope, decl, objValue = null) => {
   const objectKnownValue = knownValue(scope, object);
 
   const obj = reuse(scope, objectValue);
-  const prop = reuse(scope, generate(scope, property));
 
   // a?.b / a?.[b] : a nullish base short-circuits the whole chain to undefined
   if (decl.optional) {
@@ -4122,6 +4121,8 @@ const generateMember = (scope, decl, objValue = null) => {
       stmt(scope, Break(scope.chainLabel));
     });
   }
+
+  const prop = reuse(scope, generate(scope, property));
 
   // builtin prototype getters dispatch to __X_prototype_NAME$get by the object's runtime type
   let extraBC = [];
