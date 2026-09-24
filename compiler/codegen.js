@@ -2572,7 +2572,8 @@ const generateVarDstr = (scope, kind, pattern, init, defaultValue, global) => {
     allocVar(scope, name, global, typed?.irType ?? T.jsval);
 
     const metadata = { kind };
-    if (pattern._storageType != null) metadata.storageType = pattern._storageType;
+    // read before any write it can observe undefined, so no raw slot
+    if (pattern._storageType != null && !(pattern._uninitialized && pattern._storageHazardRef)) metadata.storageType = pattern._storageType;
     if (init?.type === 'ObjectExpression') {
       metadata.ownProperties = new Set();
       for (const prop of init.properties) {
