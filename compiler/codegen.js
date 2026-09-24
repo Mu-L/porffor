@@ -4024,7 +4024,7 @@ const generateObject = (scope, decl) => {
     if (hash != null) {
       keys.add(key.value);
       const prop = reuse(scope, generate(scope, key));
-      const val = reuse(scope, generate(scope, value));
+      const val = reuse(scope, coerceValue(generate(scope, value), T.jsval));
       const entries = Load('u32', JvPtr(obj), 12);
       stmt(scope, Store('i32', entries, slot * 20, Const(T.i32, hash)));
       stmt(scope, Store('u32', entries, slot * 20 + 4, JvPtr(prop)));
