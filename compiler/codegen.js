@@ -4803,6 +4803,8 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         }
       }
 
+      if (hasClosureOwnEnv(func) && func.closureOwnThis) mirrorToClosureEnv(func, '#this', { type: 'ThisExpression' });
+
       for (let i = 0; i < args.length; i++) {
         const { name: argName, def, destr, type, inferredType } = args[i];
         if (args[i].rest) allocVar(func, argName);
@@ -4817,6 +4819,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
 
         if (args[i].rest) {
           setLocalWithType(func, argName, false, Local('#rest', T.jsval), false, TYPES.array);
+          if (hasClosureOwnEnv(func) && func.closureOwnLocals?.[argName]) mirrorToClosureEnv(func, argName);
           continue;
         }
 
@@ -4830,15 +4833,9 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         }
 
         if (destr) generateVarDstr(func, 'var', destr, { type: 'Identifier', name: argName }, undefined, false);
-      }
 
-      if (hasClosureOwnEnv(func)) {
-        for (const { name: argName } of args) {
-          if (!func.closureOwnLocals?.[argName]) continue;
-          mirrorToClosureEnv(func, argName);
-        }
-
-        if (func.closureOwnThis) mirrorToClosureEnv(func, '#this', { type: 'ThisExpression' });
+        // mirror as each param settles, a later default may be a closure reading it
+        if (hasClosureOwnEnv(func) && func.closureOwnLocals?.[argName]) mirrorToClosureEnv(func, argName);
       }
 
       func.identFailEarly = false;
