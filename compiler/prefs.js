@@ -8,6 +8,10 @@ const getPrefs = () => {
 
   for (const x of process.argv) {
     if (x[0] !== '-') continue;
+    // short numeric flags: -O3, -j8
+    const num = /^-([A-Za-z])(\d+)$/.exec(x);
+    if (num) { prefs[num[1]] = +num[2]; continue; }
+    if (/^-O\w*$/.test(x)) { prefs.O = x.slice(2); continue; }
 
     let flag = x.slice(x[1] === '-' ? 2 : 1);
     if (flag.startsWith('no-')) {

@@ -247,15 +247,49 @@ const f64Lit = value => {
   return `porf_bits_to_f64(0x${hex}ull)`;
 };
 
-export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, usedTypes = null }) => {
-  const out = [];
-  const emit = s => out.push(s);
-  const st = 'static ';
+export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, prefs = {}, usedTypes = null, units = null }) => {
+  // split: one C file per unit sharing a header, link-time constants as externs
+  const split = !!prefs.split;
+  const st = split ? '' : 'static ';
 
   const funcByName = new Map();
   for (const f of funcs) if (f) funcByName.set(f.name, f);
   const funcOf = ref => typeof ref === 'number' ? funcs[ref] : funcByName.get(ref);
-  const fnSym = f => `p${f.index}_${sanitize(String(f.name))}`;
+
+  // contiguous function indices per unit in source order: fnbase_<unit> + local
+  const unitOf = f => f.internal ? 'builtins' : f.unit ?? 'main';
+  const funcsByUnit = new Map();
+  for (const f of funcs) {
+    if (!f) continue;
+    if (!funcsByUnit.has(unitOf(f))) funcsByUnit.set(unitOf(f), []);
+    funcsByUnit.get(unitOf(f)).push(f);
+  }
+  const unitOrder = [ 'builtins', ...(units ?? []).map(u => u.id) ];
+  for (const u of funcsByUnit.keys()) if (u !== 'main' && !unitOrder.includes(u)) unitOrder.push(u);
+  for (const u of dataUnits) if (u !== 'main' && !unitOrder.includes(u)) unitOrder.push(u);
+  unitOrder.push('main');
+
+  const linkFuncs = [], fnBase = {}, linkIdx = [];
+  for (const u of unitOrder) {
+    fnBase[u] = linkFuncs.length;
+    const unitFuncs = funcsByUnit.get(u) ?? [];
+    unitFuncs.sort((a, b) => (a.start ?? 1e9) - (b.start ?? 1e9) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0) || a.index - b.index);
+    for (const f of unitFuncs) {
+      linkIdx[f.index] = linkFuncs.length;
+      linkFuncs.push(f);
+    }
+  }
+
+  const syms = [], symsUsed = Object.create(null);
+  const fnSym = f => {
+    let sym = syms[f.index];
+    if (sym) return sym;
+    sym = `p_${sanitize(unitOf(f))}_${sanitize(String(f.name))}`;
+    while (symsUsed[sym]) sym += '_';
+    symsUsed[sym] = true;
+    syms[f.index] = sym;
+    return sym;
+  };
   const nativeFetchFuncSym = name => {
     const f = funcByName.get(name);
     if (!f) throw new Error(`missing native fetch function ${name}`);
@@ -288,32 +322,55 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
     ? (value, promise) => `(void)${fnSym(promiseResolveFunc)}(${value}, ${promise});`
     : (value, promise) => `porf_promise_settle_direct(${promise}, ${value}, 1);`;
 
-  // static data segments are copied into the arena below the heap at init, DataRef(i) is a constant offset
-  const dataOffsets = [];
+  // static layout: one data block per unit, then function records, then name strings
+  const align8 = x => (x + 7) & ~7;
+  const dataOffsets = [], dbase = {};
+  let off = 16; // 0 reserved (null), small pad
+  for (const u of unitOrder) {
+    dbase[u] = off;
+    for (let i = 0; i < data.length; i++) {
+      if (dataUnits[i] !== u) continue;
+      dataOffsets[i] = off;
+      off += align8(data[i].length);
+    }
+  }
+  const fnrecBase = off;
+  off += linkFuncs.length * 8;
+  // empty names reuse offset 0 (0-length bytestring in the null region)
   const fnNameSegs = [];
   const fnNameOff = [];
-  {
-    let off = 16; // 0 reserved (null), small pad
-    for (let i = 0; i < data.length; i++) {
-      dataOffsets.push(off);
-      off += (data[i].length + 7) & ~7;
-    }
-    // Function.prototype.name strings after the data segments: #internal -> "", builtin
-    // __ns_member -> member, empty names reuse offset 0 (0-length bytestring in the null region)
-    for (const f of funcs) {
-      if (!f) { fnNameOff.push(0); continue; }
-      let name = f.jsName ?? f.name;
-      if (name.startsWith('#')) name = '';
-      if (name.startsWith('__')) name = name.split('_').pop();
-      if (name.length === 0) { fnNameOff.push(0); continue; }
-      const bytes = [ name.length & 0xff, (name.length >>> 8) & 0xff, (name.length >>> 16) & 0xff, (name.length >>> 24) & 0xff ];
-      for (let k = 0; k < name.length; k++) bytes.push(name.charCodeAt(k) & 0xff);
-      fnNameOff.push(off);
-      fnNameSegs.push({ off, bytes });
-      off += (bytes.length + 7) & ~7;
-    }
-    dataOffsets.staticEnd = off;
+  for (const f of linkFuncs) {
+    let name = f.jsName ?? f.name;
+    name = name.startsWith('__') ? name.split('_').pop() : name.split('#')[0];
+    if (name.length === 0) { fnNameOff.push(0); continue; }
+    const bytes = [ name.length & 0xff, (name.length >>> 8) & 0xff, (name.length >>> 16) & 0xff, (name.length >>> 24) & 0xff ];
+    for (let k = 0; k < name.length; k++) bytes.push(name.charCodeAt(k) & 0xff);
+    fnNameOff.push(off);
+    fnNameSegs.push({ off, bytes });
+    off += align8(bytes.length);
   }
+  const staticEnd = off;
+
+  // per-unit output and what it references (externs and prototypes in split mode)
+  const unitParts = Object.create(null);
+  const partsOf = u => unitParts[u] ??= { out: [], chunks: [], protos: [], globals: Object.create(null), fnbases: Object.create(null), dbases: Object.create(null) };
+  let cur = partsOf('main');
+  const emit = s => {
+    cur.out.push(s);
+    if (cur.out.length === 4096) {
+      cur.chunks.push(cur.out.join(''));
+      cur.out.length = 0;
+    }
+  };
+
+  const fnIdxExpr = f => {
+    // tree-shaken func captured by a closure: traps if ever called
+    if (!f) return '0xffffffffu';
+    if (!split) return `${linkIdx[f.index]}u`;
+    const u = unitOf(f);
+    cur.fnbases[u] = true;
+    return `(porf_fnbase_${sanitize(u)} + ${linkIdx[f.index] - fnBase[u]}u)`;
+  };
 
   let depth = 1;
   const ind = () => '\t'.repeat(depth);
@@ -371,11 +428,24 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
       case K.JvConst:
         return [`porf_box((f64)${node[N_B] >>> 0}u, ${node[N_A]})`, P_POSTFIX];
 
-      case K.DataRef:
-        return [`${dataOffsets[node[N_A]]}u`, P_PRIM];
+      case K.DataRef: {
+        const id = node[N_A];
+        if (!split) return [`${dataOffsets[id]}u`, P_PRIM];
+        const u = dataUnits[id];
+        cur.dbases[u] = true;
+        return [`(porf_dbase_${sanitize(u)} + ${dataOffsets[id] - dbase[u]}u)`, P_PRIM];
+      }
 
-      case K.Local:
+      case K.FuncIdx:
+        return [fnIdxExpr(funcOf(node[N_A])), P_PRIM];
+      case K.FuncRec: {
+        const f = funcOf(node[N_A]);
+        return [split ? `(porf_fnrecs + ${fnIdxExpr(f)} * 8u)` : `${fnrecBase + linkIdx[f.index] * 8}u`, P_PRIM];
+      }
+
       case K.Global:
+        cur.globals[node[N_A]] = true;
+      case K.Local:
         return [sanitize(node[N_A]), P_PRIM];
 
       case K.Bin: {
@@ -494,6 +564,7 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
       case K.Call: {
         if (node[N_A] === '__Porffor_coroutine_resume' || node[N_A] === '__Porffor_coroutine_value') usesCoro = true;
         const f = funcOf(node[N_A]);
+        if (f) cur.protos[f.index] = f;
         // direct call to a coroutine starts it instead of running the body: split args into the invocation shape
         if (f && isCoro(f)) {
           let callee = 'JV_UNDEFINED', env = '0', thisv = 'JV_UNDEFINED', newtv = 'JV_UNDEFINED';
@@ -509,8 +580,8 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
           });
           const argvArr = argv.length ? `(jsbits[]){ ${argv.map(a => packArg(a)).join(', ')} }` : '(jsbits[]){JV_UNDEFINED_BITS}';
           return [needsCoro(f)
-            ? `porf_coro_start(${coroFlags(f)}u, ${f.index}u, ${callee}, ${env}, ${thisv}, ${newtv}, ${argv.length}, ${argvArr})`
-            : `porf_async_call_sync(${f.index}u, ${callee}, ${env}, ${thisv}, ${newtv}, ${argv.length}, ${argvArr})`, P_POSTFIX];
+            ? `porf_coro_start(${coroFlags(f)}u, ${fnIdxExpr(f)}, ${callee}, ${env}, ${thisv}, ${newtv}, ${argv.length}, ${argvArr})`
+            : `porf_async_call_sync(${fnIdxExpr(f)}, ${callee}, ${env}, ${thisv}, ${newtv}, ${argv.length}, ${argvArr})`, P_POSTFIX];
         }
         const name = f ? fnSym(f) : sanitize(String(node[N_A]));
         const args = node[N_B].map(a => rx(a, P_COMMA)).join(', ');
@@ -563,6 +634,7 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
     if (node == null) return;
     switch (node[N_KIND]) {
       case K.Assign:
+        if (node[N_A][N_KIND] === K.Global) cur.globals[node[N_A][N_A]] = true;
         emit(`${ind()}${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
         return;
 
@@ -792,9 +864,10 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
   };
 
   const renderFunc = f => {
+    cur = partsOf(unitOf(f));
     const ret = CT[f.retType];
     const params = f.params.map(p => `${CT[p.type]} ${sanitize(p.name)}`).join(', ');
-    emit(`${NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
+    emit(`${f.ast?._module ? 'PORF_ONCE ' : NEVER_INLINE.has(f.name) ? 'PORF_NOINLINE ' : ''}${ret} ${fnSym(f)}(${params || 'void'}) {\n`);
     depth = 1;
     activeTryDepth = 0;
     loopStack.length = 0;
@@ -810,18 +883,40 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
     emit(`}\n\n`);
   };
 
-  for (const f of funcs) if (f) renderFunc(f);
+  for (const f of linkFuncs) renderFunc(f);
 
-  const head = [];
+  // runtime prelude: porf.h + porf_runtime.c in split mode
+  const runtimeRefs = [];
+  const prelude = [];
   const toStr = funcs.find(x => x && x.name === '__ecma262_ToString' && x.body);
-  head.push(RUNTIME_HEAD(dataOffsets.staticEnd, prefs, usesThreads, usesCoro, toStr ? fnSym(toStr) : null));
-  if (usesCoro) head.push(CORO_RUNTIME(usesThreads));
+  if (toStr) runtimeRefs.push(toStr);
+  if (promiseResolveFunc) runtimeRefs.push(promiseResolveFunc);
+  prelude.push(RUNTIME_HEAD(prefs, usesThreads, usesCoro, toStr ? fnSym(toStr) : null));
+  if (usesCoro) prelude.push(CORO_RUNTIME(usesThreads));
+  if (usesThreads) {
+    const entryFunc = funcByName.get('__Porffor_threads_entry');
+    const promiseRunOneFunc = funcByName.get('__Porffor_promise_runOne');
+    if (!entryFunc) throw new Error('missing Porffor threads entry function');
+    if (!promiseRunOneFunc) throw new Error('missing promise reaction runner for Porffor threads');
+    const vals = [ 'fnv', 'argsv', 'promv' ];
+    const types = [ 'fnt', 'argst', 'promt' ];
+    const entryArgs = entryFunc.params.map((p, i) => {
+      if (p.type === T.jsval) return `porf_box(task->${vals[i]}, task->${types[i]})`;
+      if (p.type === T.f64) return `task->${vals[i]}`;
+      if (p.type === T.i32 || p.type === T.u32 || p.type === T.ptr) return `task->${types[i]}`;
+      return `(${CT[p.type]})task->${vals[i]}`;
+    }).join(', ');
+    runtimeRefs.push(entryFunc, promiseRunOneFunc);
+    prelude.push(THREAD_RUNTIME(fnSym(entryFunc), entryArgs, fnSym(promiseRunOneFunc), prefs, usesCoro));
+  }
 
+  // link unit head: static data image, globals, gc roots, per-function tables
+  const link = [];
   if (data.length > 0 || fnNameSegs.length > 0) {
     // static data is constant bytes at fixed offsets: one contiguous image (holes stay
     // zero) init'd by a single memcpy, emitted as string literals (~1 char per ascii byte)
     const imageBase = 16;
-    const image = new Uint8Array(dataOffsets.staticEnd - imageBase);
+    const image = new Uint8Array(staticEnd - imageBase);
     const writeBytes = (off, bytes) => {
       off -= imageBase;
       for (let k = 0; k < bytes.length; k++) image[off + k] = bytes[k];
@@ -832,6 +927,7 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
       for (let k = 0; k < 8; k++) image[off + k] = Number((bits >> BigInt(k * 8)) & 0xFFn);
     };
 
+    for (let i = 0; i < linkFuncs.length; i++) writeU32(fnrecBase + i * 8, i);
     for (const { off, bytes } of fnNameSegs) writeBytes(off, bytes);
     for (let i = 0; i < data.length; i++) {
       const seg = data[i];
@@ -891,32 +987,31 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
     }
     if (parts.length > 0 || lines.length === 0) lines.push('"' + parts.join('') + '"');
 
-    head.push(`static const u8 porf_data[] =\n${lines.join('\n')};\n${init}`);
+    link.push(`static const u8 porf_data[] =\n${lines.join('\n')};\n${init}`);
   } else {
-    head.push('static void porf_data_init(void) {}\n\n');
+    link.push('static void porf_data_init(void) {}\n\n');
   }
 
-  // forward decls, tree-shaken (null) funcs get a trap wrapper instead
-  for (const f of funcs) {
-    if (!f) continue;
-    const params = f.params.map(p => CT[p.type]).join(', ');
-    head.push(`${CT[f.retType]} ${fnSym(f)}(${params || 'void'});\n`);
-  }
-  head.push(`${st}jsval porf_call_dynamic(jsval fn, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`);
-  head.push(`${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr);\n`);
-  if (usesSyncAsync) {
-    head.push(`${st}jsval porf_async_call_sync(u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`);
-  }
+  const proto = f => `${CT[f.retType]} ${fnSym(f)}(${f.params.map(p => CT[p.type]).join(', ') || 'void'});\n`;
+  const linkProtos = [
+    `${st}jsval porf_call_dynamic(jsval fn, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`,
+    `${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr);\n`
+  ];
+  if (usesSyncAsync) linkProtos.push(`${st}jsval porf_async_call_sync(u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`);
   if (usesCoro) {
     // coroutine entry points called from user code / builtins above their definitions
-    head.push(`${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`);
-    head.push(`${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode);\n`);
-    head.push(`${st}jsval __Porffor_coroutine_value(jsval gen);\n`);
+    linkProtos.push(`${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv);\n`);
+    linkProtos.push(`${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode);\n`);
+    linkProtos.push(`${st}jsval __Porffor_coroutine_value(jsval gen);\n`);
+  }
+  if (!split) {
+    for (const f of linkFuncs) link.push(proto(f));
+    link.push(...linkProtos);
   }
 
   // module globals (top-level JS bindings)
-  for (const g of globals) head.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
-  head.push('\n');
+  for (const g of globals) link.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
+  link.push('\n');
   if (gcEnabled) {
     const markGlobalRootLines = [];
     const markGlobalRawLines = [];
@@ -938,41 +1033,32 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
         else markGlobalRawLines.push(`  porf_gc_mark_raw((i32)${name});`);
       }
     }
-    head.push(`static void porf_gc_mark_global_roots(void) {\n${markGlobalRootLines.join('\n') || '  (void)0;'}\n}\n\n`);
-    head.push(`static void porf_gc_mark_global_raw_roots(void) {\n${markGlobalRawLines.join('\n') || '  (void)0;'}\n}\n\n`);
-    head.push(usesCoro
-      ? `static void porf_gc_mark_coro_roots(void) {\n  for (i32 i = 0; i < porf_coro_live_len; i++) {\n    porf_coro* c = porf_coro_live[i];\n    if (c) porf_coro_gc_mark_suspended(c, 0);\n  }\n  for (porf_coro* c = porf_coro_cur; c; c = c->parent) porf_coro_gc_mark_active(c);\n}\n\nstatic void porf_gc_mark_coro_handle(uintptr_t raw) {\n  porf_coro_gc_mark_handle((porf_coro_call*)raw);\n}\n\nstatic void porf_gc_finalize_body(i32 body, i32 type) {\n  if (type == ${TYPES.__porffor_generator} || type == ${TYPES.__porffor_asyncgenerator}) {\n    uintptr_t raw = *(uintptr_t*)(MEM + body);\n    *(uintptr_t*)(MEM + body) = 0;\n    porf_coro_call_free((porf_coro_call*)raw);\n  }\n}\n\n`
-      : `static void porf_gc_mark_coro_roots(void) {}\nstatic void porf_gc_mark_coro_handle(uintptr_t raw) { (void)raw; }\nstatic void porf_gc_finalize_body(i32 body, i32 type) { (void)body; (void)type; }\n\n`);
+    link.push(`${st}void porf_gc_mark_global_roots(void) {\n${markGlobalRootLines.join('\n') || '  (void)0;'}\n}\n\n`);
+    link.push(`${st}void porf_gc_mark_global_raw_roots(void) {\n${markGlobalRawLines.join('\n') || '  (void)0;'}\n}\n\n`);
+    link.push(usesCoro
+      ? `${st}void porf_gc_mark_coro_roots(void) {\n  for (i32 i = 0; i < porf_coro_live_len; i++) {\n    porf_coro* c = porf_coro_live[i];\n    if (c) porf_coro_gc_mark_suspended(c, 0);\n  }\n  for (porf_coro* c = porf_coro_cur; c; c = c->parent) porf_coro_gc_mark_active(c);\n}\n\n${st}void porf_gc_mark_coro_handle(uintptr_t raw) {\n  porf_coro_gc_mark_handle((porf_coro_call*)raw);\n}\n\n${st}void porf_gc_finalize_body(i32 body, i32 type) {\n  if (type == ${TYPES.__porffor_generator} || type == ${TYPES.__porffor_asyncgenerator}) {\n    uintptr_t raw = *(uintptr_t*)(MEM + body);\n    *(uintptr_t*)(MEM + body) = 0;\n    porf_coro_call_free((porf_coro_call*)raw);\n  }\n}\n\n`
+      : `${st}void porf_gc_mark_coro_roots(void) {}\n${st}void porf_gc_mark_coro_handle(uintptr_t raw) { (void)raw; }\n${st}void porf_gc_finalize_body(i32 body, i32 type) { (void)body; (void)type; }\n\n`);
     if (usesThreads) {
-      head.push(`static void porf_gc_mark_thread_roots(void) {\n  pthread_mutex_lock(&porf_fiber_live_lock);\n  for (porf_fiber* f = porf_fiber_live; f != NULL; f = f->live_next) {\n    porf_gc_mark_js(f->fnv, f->fnt);\n    porf_gc_mark_js(f->argsv, f->argst);\n    porf_gc_mark_js(f->promv, f->promt);\n    porf_gc_mark_js(f->fiber_exception.val, f->fiber_exception.type);\n    if (f->fiber_try_stack && f->fiber_try_depth > 0) {\n      const i32 td = f->fiber_try_depth < f->fiber_try_cap ? f->fiber_try_depth : f->fiber_try_cap;\n      porf_gc_cons_scan_range((const u64*)f->fiber_try_stack, (const u64*)(f->fiber_try_stack + td));\n    }\n    if (f != porf_fiber_current && f->sp && f->c_stack_top) porf_gc_cons_scan_range((const u64*)f->sp, (const u64*)f->c_stack_top);\n  }\n  pthread_mutex_unlock(&porf_fiber_live_lock);\n}\n\n`);
+      link.push(`${st}void porf_gc_mark_thread_roots(void) {\n  pthread_mutex_lock(&porf_fiber_live_lock);\n  for (porf_fiber* f = porf_fiber_live; f != NULL; f = f->live_next) {\n    porf_gc_mark_js(f->fnv, f->fnt);\n    porf_gc_mark_js(f->argsv, f->argst);\n    porf_gc_mark_js(f->promv, f->promt);\n    porf_gc_mark_js(f->fiber_exception.val, f->fiber_exception.type);\n    if (f->fiber_try_stack && f->fiber_try_depth > 0) {\n      const i32 td = f->fiber_try_depth < f->fiber_try_cap ? f->fiber_try_depth : f->fiber_try_cap;\n      porf_gc_cons_scan_range((const u64*)f->fiber_try_stack, (const u64*)(f->fiber_try_stack + td));\n    }\n    if (f != porf_fiber_current && f->sp && f->c_stack_top) porf_gc_cons_scan_range((const u64*)f->sp, (const u64*)f->c_stack_top);\n  }\n  pthread_mutex_unlock(&porf_fiber_live_lock);\n}\n\n`);
     }
   }
 
   // per-function metadata tables, emitted before bodies so __Porffor_funcLut_* can read them.
   // porf_fnflags: bits 0-2 coroutine dispatch (masked off in porf_call_dynamic), bit 3 callable,
   // bit 4 constructor, funcLut.flags recovers legacy callable|constr<<1 via (flags >> 3) & 3
-  head.push(`${st}const u8 porf_fnflags[] = { ${Array.from(funcs, fnFlags).join(', ') || '0'} };\n`);
-  if (usesSyncAsync) head.push(`${st}const u8 porf_fnneeds_coro[] = { ${Array.from(funcs, f => needsCoro(f) ? 1 : 0).join(', ') || '0'} };\n`);
-  head.push(`${st}const u16 porf_fnlen[] = { ${Array.from(funcs, f => f?.jsLength ?? 0).join(', ') || '0'} };\n`);
-  head.push(`${st}const u32 porf_fnname[] = { ${fnNameOff.join(', ') || '0'} };\n`);
-  head.push('\n');
-
-  if (prefs.rawHead) head.push(prefs.rawHead + '\n');
-  if (usesThreads) {
-    const entryFunc = funcByName.get('__Porffor_threads_entry');
-    const promiseRunOneFunc = funcByName.get('__Porffor_promise_runOne');
-    if (!entryFunc) throw new Error('missing Porffor threads entry function');
-    if (!promiseRunOneFunc) throw new Error('missing promise reaction runner for Porffor threads');
-    const vals = [ 'fnv', 'argsv', 'promv' ];
-    const types = [ 'fnt', 'argst', 'promt' ];
-    const entryArgs = entryFunc.params.map((p, i) => {
-      if (p.type === T.jsval) return `porf_box(task->${vals[i]}, task->${types[i]})`;
-      if (p.type === T.f64) return `task->${vals[i]}`;
-      if (p.type === T.i32 || p.type === T.u32 || p.type === T.ptr) return `task->${types[i]}`;
-      return `(${CT[p.type]})task->${vals[i]}`;
-    }).join(', ');
-    head.push(THREAD_RUNTIME(fnSym(entryFunc), entryArgs, fnSym(promiseRunOneFunc), prefs, usesCoro));
+  link.push(`${st}const u8 porf_fnflags[] = { ${linkFuncs.map(fnFlags).join(', ') || '0'} };\n`);
+  if (usesSyncAsync) link.push(`${st}const u8 porf_fnneeds_coro[] = { ${linkFuncs.map(f => needsCoro(f) ? 1 : 0).join(', ') || '0'} };\n`);
+  link.push(`${st}const u16 porf_fnlen[] = { ${linkFuncs.map(f => f.jsLength ?? 0).join(', ') || '0'} };\n`);
+  link.push(`${st}const u32 porf_fnname[] = { ${fnNameOff.join(', ') || '0'} };\n`);
+  link.push(`const u32 porf_static_end = ${staticEnd}u;\n`);
+  if (split) {
+    link.push(`const u32 porf_fnrecs = ${fnrecBase}u;\n`);
+    for (const u of unitOrder) link.push(`const u32 porf_fnbase_${sanitize(u)} = ${fnBase[u]}u;\nconst u32 porf_dbase_${sanitize(u)} = ${dbase[u]}u;\n`);
   }
+  link.push('\n');
+
+  cur = partsOf('main');
+  for (const f of linkFuncs) cur.protos[f.index] = f;
 
   // dynamic call: one switch dispatcher, no per-function wrappers. fn values are records
   // [fnIdx u32][env u32] (payload = offset, nonzero = truthy), each case adapts the
@@ -980,9 +1066,9 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
   emit(`${st}jsval porf_invoke(u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv) {\n`);
     emit('  (void)callee; (void)env; (void)thisv; (void)newtv; (void)argc; (void)argv;\n');
     emit('  switch (idx) {\n');
-    for (let i = 0; i < funcs.length; i++) {
-      const f = funcs[i];
-      if (!f || (!f.indirect && !needsCoro(f) && !isSyncAsync(f))) continue;
+    for (let i = 0; i < linkFuncs.length; i++) {
+      const f = linkFuncs[i];
+      if (!f.indirect && !needsCoro(f) && !isSyncAsync(f)) continue;
       const pre = [];
       const args = [];
       let j = 0;
@@ -1251,7 +1337,7 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, jsval callee, u32 env, jsval thisv
   const u32 rec = (u32)fn.val;
   const u32 idx = *(u32*)(MEM + rec);
   const u32 env = *(u32*)(MEM + rec + 4);
-  if (idx >= ${funcs.length}u) porf_unreachable("bad function index");
+  if (idx >= ${linkFuncs.length}u) porf_unreachable("bad function index");
   const u8 flags = porf_fnflags[idx] & (7u | ${FN_CORO_INIT}u);
   const u8 kind = flags & 7u;
   if (!porf_jv_eq(newtv, JV_UNDEFINED) && kind != 0) porf_throw_new(${TYPES.typeerror}, 0);
@@ -1322,7 +1408,7 @@ static void porf_native_release_timer(porf_native_timer_record* timer) {
   timer->args = JV_UNDEFINED;
 }
 
-static u32 porf_native_fetch_set_timer(jsval callback, jsval args, jsval delay_value, i32 repeat) {
+${st}u32 porf_native_fetch_set_timer(jsval callback, jsval args, jsval delay_value, i32 repeat) {
   if (callback.type != ${TYPES.function}) porf_throw_new(${TYPES.typeerror}, 0);
   f64 delay_ms = delay_value.type == ${TYPES.number} ? delay_value.val : 0;
   if (delay_ms != delay_ms || delay_ms < 0) delay_ms = 0;
@@ -1367,7 +1453,7 @@ ${prefs.eventLoop ? '  porf_native_fetch_timer_start(id, (i32)delay_ms, timer->r
   return id;
 }
 
-static void porf_native_fetch_clear_timer(jsval timer_value) {
+${st}void porf_native_fetch_clear_timer(jsval timer_value) {
   u32 id = timer_value.type == ${TYPES.number} ? (u32)timer_value.val : (u32)timer_value.val;
   porf_native_timer_record* timer = porf_native_find_timer(id);
   if (!timer) return;
@@ -1560,11 +1646,115 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
     emit(`int main(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  ${usesThreads ? 'porf_threads_drain();\n  ' : ''}return 0;\n}\n`);
   }
 
-  if (usesMath) head.splice(1, 0, '#include <math.h>\n');
-  const c = head.join('') + out.join('');
-  if (!prefs.nativeFetch) return usesThreads ? { c, threads: true } : c;
+  if (usesMath) prelude.splice(1, 0, '#include <math.h>\n');
+  if (prefs.rawHead) prelude.push(prefs.rawHead + '\n');
 
-  return { c, nativeFetch: true, threads: usesThreads };
+  const globalTypes = Object.create(null);
+  for (const g of globals) globalTypes[g.name] = g.type;
+  const unitText = (u, parts) => {
+    const text = [];
+    if (split) {
+      text.push('#include "porf.h"\n');
+      for (const x of Object.keys(parts.fnbases).sort()) text.push(`extern const u32 porf_fnbase_${sanitize(x)};\n`);
+      for (const x of Object.keys(parts.dbases).sort()) text.push(`extern const u32 porf_dbase_${sanitize(x)};\n`);
+      for (const x of Object.keys(parts.globals).sort()) text.push(`extern ${CT[globalTypes[x]]} ${sanitize(x)};\n`);
+      for (const f of parts.protos.filter(Boolean).sort((a, b) => linkIdx[a.index] - linkIdx[b.index])) text.push(proto(f));
+      text.push('\n');
+      if (u === 'main') text.push(link.join(''));
+    }
+    return text.concat(parts.chunks, parts.out).join('');
+  };
+
+  if (!split) {
+    const text = prelude.concat(link);
+    for (const u of unitOrder) if (unitParts[u]) text.push(unitText(u, unitParts[u]));
+    const c = text.join('');
+    if (!prefs.nativeFetch) return usesThreads ? { c, threads: true } : c;
+    return { c, nativeFetch: true, threads: usesThreads };
+  }
+
+  const rt = splitRuntime(prelude.join(''));
+  const header = rt.header +
+    `extern const u8 porf_fnflags[];\n${usesSyncAsync ? 'extern const u8 porf_fnneeds_coro[];\n' : ''}extern const u16 porf_fnlen[];\nextern const u32 porf_fnname[];\nextern const u32 porf_fnrecs;\n` +
+    linkProtos.join('');
+  const unitName = u => {
+    const name = units?.find(x => x.id === u)?.name;
+    return name ? name.replace(/^[/]/, '').replace(/[^\w.-]/g, '_') + '.' + u + '.c' : `porf_${sanitize(u)}.c`;
+  };
+  const files = [
+    { name: 'porf.h', c: header },
+    { name: 'porf_runtime.c', c: '#include "porf.h"\n' + runtimeRefs.map(proto).join('') + rt.impl }
+  ];
+  for (const u of unitOrder) if (unitParts[u]) files.push({ name: unitName(u), c: unitText(u, unitParts[u]) });
+  return { files, threads: usesThreads, nativeFetch: !!prefs.nativeFetch };
+};
+
+// split runtime C into header declarations and implementation
+const splitRuntime = text => {
+  const header = [], impl = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    while (i < n && (text[i] === ' ' || text[i] === '\t' || text[i] === '\n')) i++;
+    if (i >= n) break;
+    const start = i;
+
+    if (text[i] === '#') {
+      let end = text.indexOf('\n', i);
+      if (end === -1) end = n;
+      while (text[end - 1] === '\\') end = text.indexOf('\n', end + 1);
+      header.push(text.slice(start, end));
+      impl.push(text.slice(start, end));
+      i = end;
+      continue;
+    }
+    if (text.startsWith('//', i)) {
+      const end = text.indexOf('\n', i);
+      header.push(text.slice(start, end));
+      i = end;
+      continue;
+    }
+
+    let depth = 0, braceAt = -1, eqAt = -1, parenAt = -1;
+    for (; i < n; i++) {
+      const c = text[i];
+      if (c === '"' || c === "'") {
+        for (i++; text[i] !== c; i++) if (text[i] === '\\') i++;
+        continue;
+      }
+      if (c === '/' && text[i + 1] === '/') { i = text.indexOf('\n', i); continue; }
+      if (c === '/' && text[i + 1] === '*') { i = text.indexOf('*/', i) + 1; continue; }
+      if (depth === 0 && c === '\n' && text[i + 1] === '#') break;
+      if (depth === 0 && braceAt === -1) {
+        if (c === '=' && eqAt === -1 && text[i + 1] !== '=') eqAt = i;
+        if (c === '(' && eqAt === -1 && parenAt === -1) parenAt = i;
+      }
+      if (c === '{') { if (braceAt === -1) braceAt = i; depth++; }
+      else if (c === '}') {
+        depth--;
+        // a type or initializer runs on to its `;`, a function body ends here
+        if (depth === 0 && eqAt === -1 && !/^(?:typedef|struct|union|enum)\b/.test(text.slice(start, braceAt))) { i++; break; }
+      }
+      else if (c === ';' && depth === 0) { i++; break; }
+    }
+    const chunk = text.slice(start, i);
+    const spec = chunk.slice(0, Math.min(...[ parenAt, eqAt, braceAt, i ].filter(x => x !== -1)) - start);
+    const isType = /^(?:typedef|struct|union|enum)\b/.test(chunk);
+    const isFunc = !isType && parenAt !== -1 && braceAt !== -1 && eqAt === -1;
+    const isProto = !isType && parenAt !== -1 && braceAt === -1 && eqAt === -1 && !/\(\*\w+\)/.test(chunk);
+    const unstatic = str => str.replace(/\bstatic\s+/, '');
+
+    if (isType || /^extern\b/.test(chunk) || (isFunc && /\binline\b/.test(spec)) || /^static\s+const\b/.test(chunk)) header.push(chunk);
+    else if (isFunc) {
+      header.push(unstatic(chunk.slice(0, braceAt - start)).trim() + ';');
+      impl.push(unstatic(chunk));
+    } else if (isProto) header.push(/\binline\b/.test(chunk) ? chunk : unstatic(chunk));
+    else {
+      header.push('extern ' + unstatic(eqAt === -1 ? chunk.slice(0, -1) : chunk.slice(0, eqAt - start)).trim() + ';');
+      impl.push(unstatic(chunk));
+    }
+  }
+  return { header: header.join('\n') + '\n', impl: impl.join('\n\n') + '\n' };
 };
 
 const PORF_BUMP_ALLOC = () => {
@@ -1594,7 +1784,7 @@ static void porf_arena_init(void) {
     exit(1);
   }
   porf_mem = (u8*)got;
-  porf_heap_base = (PORF_STATIC_END + 4095u) & ~4095u;
+  porf_heap_base = (porf_static_end + 4095u) & ~4095u;
   porf_heap_cur = porf_heap_base + 8;
   porf_heap_committed = PORF_CAN_DECOMMIT ? 0u : (u32)PORF_ARENA_RESERVE;
   porf_commit(porf_heap_base + 65536u);
@@ -1822,7 +2012,7 @@ static void porf_arena_init(void) {
     exit(1);
   }
   porf_mem = (u8*)got;
-  porf_heap_base = (PORF_STATIC_END + PORF_GC_SPAGE_MASK) & ~PORF_GC_SPAGE_MASK;
+  porf_heap_base = (porf_static_end + PORF_GC_SPAGE_MASK) & ~PORF_GC_SPAGE_MASK;
   porf_heap_top = porf_heap_base;
   porf_heap_committed = PORF_CAN_DECOMMIT ? 0ull : (u64)PORF_ARENA_RESERVE;
   porf_commit(porf_heap_base + 65536u);
@@ -2857,7 +3047,7 @@ static void porf_gc_mark_js(f64 value, i32 type) {
   const i32 body = porf_gc_value_body(value, type);
   if (body == 0) return;
   // static strings hold no references and are never freed
-  if ((u32)body < PORF_STATIC_END && (type == ${TYPES.bytestring} || type == ${TYPES.string})) return;
+  if ((u32)body < porf_heap_base && (type == ${TYPES.bytestring} || type == ${TYPES.string})) return;
   if (porf_gc_is_block_start(body)) {
     if (type == ${TYPES.object} && !porf_gc_object_shape_valid(body)) return;
     if (!porf_gc_mark_body(body)) {
@@ -2931,7 +3121,7 @@ static void porf_gc_scan_object_entries_range(i32 entries, u32 from, u32 to) {
     const i32 entry = entries + (i32)(i * 20u);
     const i32 key_type = *(u8*)(MEM + entry + 18);
     const u32 key = *(u32*)(MEM + entry + 4);
-    if (key >= PORF_STATIC_END && porf_gc_type_can_reference(key_type)) porf_gc_mark_js((f64)key, key_type);
+    if (key >= porf_heap_base && porf_gc_type_can_reference(key_type)) porf_gc_mark_js((f64)key, key_type);
     const u8 flags = *(u8*)(MEM + entry + 16);
     if ((flags & 1u) != 0u) {
       const u32 get = *(u32*)(MEM + entry + 8);
@@ -4129,7 +4319,7 @@ static void porf_threads_drain(void) {
 // jsval encoding: f64 numbers are themselves, else 0xFFF8 (sign + quiet-NaN) << 48 |
 // type:8 << 43 | payload:32. hardware qNaN is 0x7FF8 (sign clear) so never collides,
 // sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
-const RUNTIME_HEAD = (staticEnd, prefs, usesThreads = false, usesCoro = false, toStr = null) => {
+const RUNTIME_HEAD = (prefs, usesThreads = false, usesCoro = false, toStr = null) => {
   const st = 'static ';
   const sti = 'static inline ';
   return `// generated by porffor ${globalThis.version}
@@ -4277,6 +4467,14 @@ static _Thread_local NativeFetchResponseParts* porf_native_fetch_response_parts_
 ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define MEM porf_mem
 #define PORF_NOINLINE __attribute__((noinline))
+// run-once code (module init, top level): optimize for size whatever -O the unit gets
+#if defined(__clang__)
+#define PORF_ONCE __attribute__((noinline, minsize))
+#elif defined(__GNUC__)
+#define PORF_ONCE __attribute__((noinline, optimize("Os")))
+#else
+#define PORF_ONCE
+#endif
 #define PORF_NORETURN __attribute__((cold, noinline, noreturn))
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -4294,7 +4492,7 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define PORF_MMAP_RESERVE_PROT PROT_NONE
 #define PORF_CAN_DECOMMIT 1
 #endif
-#define PORF_STATIC_END ${staticEnd}u
+extern const u32 porf_static_end;
 #define PORF_GC_ENABLED ${prefs.gc === false ? 0 : 1}
 
 #define JV_PATTERN 0xFFF8000000000000ull

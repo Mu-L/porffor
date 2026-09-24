@@ -1,5 +1,6 @@
 import './prefs.js';
 import parse from './parser/index.js';
+import link from './modules.js';
 
 const usesTemporal = node => {
   if (node == null || typeof node !== 'object') return false;
@@ -26,11 +27,14 @@ const usesTemporal = node => {
   return false;
 };
 
-export default input => {
+// entry: link options for a program entry ({ file?, scripts? }), null for a lone source
+export default (input, entry = null) => {
   const types = Prefs.parseTypes || Prefs.t || globalThis.file?.endsWith('.ts');
   globalThis.typedInput = types && Prefs.optTypes;
 
-  const ast = parse(input, { module: !!Prefs.module, ts: types });
+  const file = entry?.file ?? globalThis.file;
+  const ast = entry && Prefs.module && !globalThis.precompile ? link(input, file[0] === '/' ? file : process.cwd() + '/' + file, { ts: types, scripts: entry.scripts }) : parse(input, { module: !!Prefs.module, ts: types });
+  if (ast._ts) globalThis.typedInput = Prefs.optTypes;
   if (usesTemporal(ast)) ast._usesTemporal = true;
   return ast;
 };

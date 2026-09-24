@@ -54,6 +54,7 @@ const help = () => {
     for (let [ flag, desc ] of Object.entries({
       'fast-length': 'Non-compliant optimization to make .length faster',
       'profile-compiler': 'Log general compiler performance (on by default when compiling to a file)',
+      'jN': 'Parallel C compile jobs for module builds (default: CPU count)',
     })) {
       flag = '-' + flag;
       if (flag.length > 3) flag = '-' + flag;
@@ -150,7 +151,7 @@ entrypoint: {
 
   try {
     if ((Prefs.target === 'c' || Prefs.target === 'native') && DEFAULT_EXPORT_PATTERN.test(source) && source.includes('fetch')) {
-      (await import('./native-fetch.js')).default(inputFile, source);
+      (await import('./native-fetch.js')).default(inputFile);
     } else {
       (await import('../compiler/index.js')).default(source, Prefs.module ?? looksLikeModule(inputFile, source));
     }

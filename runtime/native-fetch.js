@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import compile from '../compiler/index.js';
 
 const FETCH_GLOBALS = fs.readFileSync(new URL('./fetch-globals.js', import.meta.url), 'utf8');
@@ -32,44 +31,14 @@ export function __Porffor_fetch_native_handle(method, url, headerEntries, body) 
 }
 `;
 
-const autoBundleNativeFetchModule = filename => {
-  const cwd = path.dirname(path.resolve(filename));
-
-  try {
-    return execFileSync('esbuild', [
-      '--bundle',
-      '--format=esm',
-      '--platform=neutral',
-      '--target=es2022',
-      '--conditions=worker',
-      '--main-fields=browser,module,main',
-      '--loader=ts',
-      `--banner:js=${FETCH_GLOBALS}`,
-      '--sourcefile=porffor-native-fetch-entry.ts',
-      `--define:process.env.NODE_ENV="${Prefs.d ? 'development' : 'production'}"`
-    ], {
-      cwd,
-      input: makeNativeFetchVirtualEntry(filename),
-      stdio: 'pipe'
-    }).toString();
-  } catch (error) {
-    if (error?.code === 'ENOENT') {
-      throw new Error('Auto-bundling fetch modules requires the `esbuild` command to be available on PATH');
-    }
-
-    const stderr = error?.stderr?.toString?.().trim?.();
-    const stdout = error?.stdout?.toString?.().trim?.();
-    throw new Error(stderr || stdout || `esbuild failed while auto-bundling ${filename}`);
-  }
-};
-
-export default (file, source) => {
+export default file => {
   Prefs.nativeFetch = true;
   if (Prefs.eventLoop == null) Prefs.eventLoop = true;
   Prefs.gc = true;
-  globalThis.file = 'fetch.mjs';
 
-  const bundledSource = autoBundleNativeFetchModule(file, source) + NATIVE_FETCH_RESPONSE_FINALIZER;
-
-  compile(bundledSource, true);
+  const resolved = path.resolve(file);
+  compile(makeNativeFetchVirtualEntry(resolved) + NATIVE_FETCH_RESPONSE_FINALIZER, true, {
+    file: path.join(path.dirname(resolved), '__porffor_fetch_entry.mjs'),
+    scripts: [ FETCH_GLOBALS ]
+  });
 };

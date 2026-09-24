@@ -239,8 +239,10 @@ const load = file => {
 
   let source = fs.readFileSync(file, 'utf8').replace(/^#!.*\n/, '');
 
-  if (file.endsWith('/compiler/index.js')) {
+  if (file.endsWith('/compiler/index.js') || file.endsWith('/compiler/modules.js')) {
     source = source.replace(`const fs = (typeof process?.version !== 'undefined' ? (await import('node:fs')) : undefined);`, `const fs = globalThis.__porfforNode.fs;`);
+  }
+  if (file.endsWith('/compiler/index.js')) {
     source = source.replace(`const { execSync } = (typeof process?.version !== 'undefined' ? (await import('node:child_process')) : {});`, `const { execSync } = globalThis.__porfforNode.child_process;`);
     source = `import * as uwebsockets from './uwebsockets.js';\n` + source;
     source = source.replace(`const uwebsockets = (typeof process?.version !== 'undefined' ? (await import('./uwebsockets.js')) : undefined);`, ``);
@@ -312,8 +314,8 @@ import __porfforCompile from '../compiler/index.js';
     source = rewritten;
     source = `import __porfforNativeFetch from './native-fetch.js';\n` + source;
     const nativeFetch = source.replace(
-      `(await import('./native-fetch.js')).default(inputFile, source);`,
-      `__porfforNativeFetch(inputFile, source);`
+      `(await import('./native-fetch.js')).default(inputFile);`,
+      `__porfforNativeFetch(inputFile);`
     );
     if (nativeFetch === source) throw new Error('selfhost native-fetch rewrite failed');
     source = nativeFetch;

@@ -1,6 +1,6 @@
 
 import { TYPES, TYPE_NAMES } from './types.js';
-import { K, T } from './ir.js';
+import { K } from './ir.js';
 import { ieee754_binary64 } from './encoding.js';
 
 import process from 'node:process';
@@ -47,19 +47,19 @@ const compile = async (file, _funcs) => {
   timing.parse = (timing.parse ?? 0) + (times[1] - times[0]);
   timing.codegen = (timing.codegen ?? 0) + (times[2] - times[1]);
 
-  const remapCallTargets = (node, owner) => {
+  const remapFuncRefs = (node, owner) => {
     if (node == null || typeof node !== 'object') return;
     if (Array.isArray(node)) {
-      if (node.length === 6 && node[0] === K.Call && typeof node[3] === 'number') {
+      if (node.length === 6 && (node[0] === K.Call || node[0] === K.FuncIdx || node[0] === K.FuncRec) && typeof node[3] === 'number') {
         const target = funcsByIndex.get(node[3]);
-        if (!target?.name) throw new Error(`${owner}: missing precompiled call target ${node[3]}`);
+        if (!target?.name) throw new Error(`${owner}: missing precompiled function ${node[3]}`);
         node[3] = target.name;
       }
-      for (const x of node) remapCallTargets(x, owner);
+      for (const x of node) remapFuncRefs(x, owner);
       return;
     }
 
-    for (const x of Object.values(node)) remapCallTargets(x, owner);
+    for (const x of Object.values(node)) remapFuncRefs(x, owner);
   };
 
   const collectDataRefs = (node, refs) => {
@@ -71,63 +71,6 @@ const compile = async (file, _funcs) => {
     }
 
     for (const x of Object.values(node)) collectDataRefs(x, refs);
-  };
-  const collectFuncDataRefs = (node, refs) => {
-    if (node == null || typeof node !== 'object') return;
-    if (Array.isArray(node)) {
-      if (
-        node.length === 6 &&
-        node[0] === K.Box &&
-        Array.isArray(node[3]) && node[3][0] === K.DataRef &&
-        Array.isArray(node[4]) && node[4][0] === K.Const && node[4][3] === TYPES.function
-      ) {
-        const id = node[3][3];
-        const bytes = data[id];
-        const idx = bytes?.[0] | (bytes?.[1] << 8) | (bytes?.[2] << 16) | (bytes?.[3] << 24);
-        const env = bytes?.[4] | (bytes?.[5] << 8) | (bytes?.[6] << 16) | (bytes?.[7] << 24);
-        const target = funcsByIndex.get(idx);
-        if (!target?.name || env !== 0) throw new Error(`invalid precompiled function ref data ${id}`);
-        refs[id] = target.name;
-      }
-      for (const x of node) collectFuncDataRefs(x, refs);
-      return;
-    }
-
-    for (const x of Object.values(node)) collectFuncDataRefs(x, refs);
-  };
-  const collectFuncIndexRefs = (node, refs) => {
-    if (!Array.isArray(node)) return;
-    for (let i = 0; i < node.length; i++) {
-      const stmt = node[i];
-      if (
-        Array.isArray(stmt) &&
-        stmt.length === 6 &&
-        stmt[0] === K.Assign &&
-        Array.isArray(stmt[3]) && stmt[3][0] === K.Local &&
-        Array.isArray(stmt[4]) && stmt[4][0] === K.Alloc &&
-        stmt[4][4] === TYPES.function &&
-        Array.isArray(stmt[4][3]) && stmt[4][3][0] === K.Const && stmt[4][3][3] === 8
-      ) {
-        const localName = stmt[3][3];
-        const next = node[i + 1];
-        const value = next?.[5]?.[2];
-        if (
-          Array.isArray(next) &&
-          next.length === 6 &&
-          next[0] === K.Store &&
-          next[3] === 'u32' &&
-          Array.isArray(next[4]) && next[4][0] === K.Local && next[4][3] === localName &&
-          Array.isArray(next[5]) && next[5][0] === 0 &&
-          Array.isArray(value) && value[0] === K.Const && value[1] === T.u32
-        ) {
-          const target = funcsByIndex.get(value[3]);
-          if (!target?.name) throw new Error(`invalid precompiled function index ${value[3]}`);
-          refs[value[3]] = target.name;
-        }
-      }
-
-      collectFuncIndexRefs(stmt, refs);
-    }
   };
   const collectGlobalRefs = (node, refs) => {
     if (node == null || typeof node !== 'object') return;
@@ -157,8 +100,8 @@ const compile = async (file, _funcs) => {
         if (globalInits[name]) (x.globalInits ??= Object.create(null))[name] = globalInits[name];
       }
     }
-    remapCallTargets(x.body, x.name);
-    if (x.globalInits) for (const name in x.globalInits) remapCallTargets(x.globalInits[name], x.name);
+    remapFuncRefs(x.body, x.name);
+    if (x.globalInits) for (const name in x.globalInits) remapFuncRefs(x.globalInits[name], x.name);
 
     // keep referenced data segments with the body so DataRef ids remap into the user compile's arena
     const dataRefs = new Set();
@@ -171,14 +114,6 @@ const compile = async (file, _funcs) => {
         x.data[i] = data[i];
       }
     }
-    const funcData = {};
-    collectFuncDataRefs(x.body, funcData);
-    if (x.globalInits) for (const name in x.globalInits) collectFuncDataRefs(x.globalInits[name], funcData);
-    if (Object.keys(funcData).length !== 0) x.funcData = funcData;
-    const funcRefs = {};
-    collectFuncIndexRefs(x.body, funcRefs);
-    if (x.globalInits) for (const name in x.globalInits) collectFuncIndexRefs(x.globalInits[name], funcRefs);
-    if (Object.keys(funcRefs).length !== 0) x.funcRefs = funcRefs;
   }
   _funcs.push(...exports);
 };
@@ -367,8 +302,7 @@ const unflatten = cur => {
 };
 
 // IR node kinds the dynamic walk cares about (mirrors ir.js K.*).
-const K_Const = ${K.Const}, K_DataRef = ${K.DataRef}, K_Global = ${K.Global}, K_TypeSwitch = ${K.TypeSwitch}, K_Call = ${K.Call}, K_Alloc = ${K.Alloc}, K_Store = ${K.Store}, K_ThrowNew = ${K.ThrowNew};
-const T_u32 = ${T.u32};
+const K_DataRef = ${K.DataRef}, K_Global = ${K.Global}, K_TypeSwitch = ${K.TypeSwitch}, K_Call = ${K.Call}, K_Alloc = ${K.Alloc}, K_ThrowNew = ${K.ThrowNew}, K_FuncIdx = ${K.FuncIdx}, K_FuncRec = ${K.FuncRec};
 
 // is \`v\` an IR node array (defensive: length-6, numeric kind/type/fx)? a value-array such as a
 // case tuple or a list of type ids fails this, and the per-kind guards below disambiguate the
@@ -425,14 +359,7 @@ const walk = (node, h) => {
   else if (kind === K_ThrowNew) h.typeUsed(node[3]);
   else if (kind === K_DataRef) node[3] = h.remapData(node[3]);
   else if (kind === K_Alloc && Array.isArray(node[5])) node[5][0] = h.remapAllocSite(node[5][0]);
-  else if (
-    kind === K_Store &&
-    node[3] === 'u32' &&
-    Array.isArray(node[5]) && node[5][0] === 0 &&
-    Array.isArray(node[5][2]) && node[5][2][0] === K_Const && node[5][2][1] === T_u32
-  ) {
-    node[5][2][3] = h.remapFuncIndex(node[5][2][3]);
-  }
+  else if (kind === K_FuncIdx || kind === K_FuncRec) h.includeBuiltin(node[3]).indirect = true;
   else if (kind === K_Global && typeof node[3] === 'string') h.global(node[3], node[1]);
 
   walk(node[3], h);
@@ -510,8 +437,6 @@ const precompile = async () => {
     if (localNames.length) { meta.localNames = localNames; meta.localTypes = localTypes; }
     if (localMeta.length) meta.localMetadata = localMeta;
     if (x.data && Object.keys(x.data).length) meta.data = x.data;
-    if (x.funcData && Object.keys(x.funcData).length) meta.funcData = x.funcData;
-    if (x.funcRefs && Object.keys(x.funcRefs).length) meta.funcRefs = x.funcRefs;
     if (x.constr) meta.constr = 1;
     if (x.closureAware) meta.closureAware = 1;
     if (x.selfAware) meta.selfAware = 1;

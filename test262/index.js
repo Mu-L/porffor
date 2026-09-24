@@ -1141,9 +1141,10 @@ if (cluster.isPrimary) {
     // compile js -> c in-process
     try {
       Prefs.module = !!job.flags.module;
+      globalThis.file = join(test262Path, 'test', job.file);
 
       let t = performance.now();
-      const program = parse(contents);
+      const program = parse(contents, {});
       if (profile) job.addProfile(1, performance.now() - t);
 
       t = performance.now();

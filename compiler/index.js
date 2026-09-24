@@ -1,6 +1,7 @@
 import parse from './parse.js';
 import codegen from './codegen.js';
 import render from './render.js';
+import { hashId } from './modules.js';
 import './prefs.js';
 
 const fs = (typeof process?.version !== 'undefined' ? (await import('node:fs')) : undefined);
@@ -38,10 +39,8 @@ const progressClear = () => {
   process.stdout.write(`\u001b[${progressLines}F\u001b[0J`);
   progressLines = 0;
 };
-export default (code, module = Prefs.module) => {
+export default (code, module = Prefs.module, opts = {}) => {
   Prefs.module = module;
-
-  const optPref = process.argv.find(x => x.startsWith('-O'))?.[2] ?? Prefs.O;
 
   let target = Prefs.target ?? 'c';
 
@@ -52,7 +51,7 @@ export default (code, module = Prefs.module) => {
 
   if (logProgress) progressStart('parsing...');
   const t0 = performance.now();
-  const program = parse(code);
+  const program = parse(code, opts);
   if (logProgress) progressDone('parsed', t0);
 
   // --parse-only: stop after parsing
@@ -69,9 +68,13 @@ export default (code, module = Prefs.module) => {
     return cg;
   }
 
+  // module programs build one C unit per source file, cached and recompiled on change
+  const outDir = !!outFile && (outFile.endsWith('/') || fs.existsSync(outFile) && fs.statSync(outFile).isDirectory());
+  const split = !!cg.units && (target === 'native' || (outDir && !Prefs.nativeFetch));
+
   if (logProgress) progressStart('rendering C...');
   const t4 = performance.now();
-  const cOut = render(cg);
+  const cOut = render({ ...cg, prefs: { ...cg.prefs, split } });
   const c = typeof cOut === 'string' ? cOut : cOut.c;
   // stop the render spinner on every target, or the native path's setInterval spins forever
   if (logProgress) progressDone('rendered C', t4);
@@ -80,6 +83,9 @@ export default (code, module = Prefs.module) => {
     if (Prefs.nativeFetch) {
       if (!outFile) throw new Error('native fetch C output requires an output directory');
       uwebsockets.writeNativeFetchPackage(outFile, cOut);
+    } else if (split) {
+      fs.mkdirSync(outFile, { recursive: true });
+      for (const x of cOut.files) fs.writeFileSync(`${outFile}/${x.name}`, x.c);
     } else if (outFile) fs.writeFileSync(outFile, c);
     else console.log(c);
 
@@ -87,7 +93,7 @@ export default (code, module = Prefs.module) => {
       const total = performance.now();
       progressClear();
       if (!outFile) return;
-      const detail = Prefs.nativeFetch ? 'C bundle' : formatSize(fs.statSync(outFile).size);
+      const detail = Prefs.nativeFetch ? 'C bundle' : split ? `${cOut.files.length} files` : formatSize(fs.statSync(outFile).size);
       console.log(`\u001b[2m[${formatTime(total)}]\u001b[0m \u001b[32mcompiled ${globalThis.file} \u001b[90m->\u001b[0m \u001b[92m${outFile}\u001b[90m (${detail})\u001b[0m`);
     }
 
@@ -102,7 +108,8 @@ export default (code, module = Prefs.module) => {
     if (Prefs.musl) compiler = [ 'zig', 'cc', '-target', 'x86_64-linux-musl' ];
     if (Prefs.musl) cxx = [ 'zig', 'c++', '-target', 'x86_64-linux-musl' ];
     const isTinyCC = compiler[0].endsWith('tcc');
-    if (!Prefs.d && Prefs.flto == null) Prefs.flto = !Prefs.musl && !isTinyCC;
+    // split builds skip lto by default: it costs seconds at every link for ~1% throughput
+    if (!Prefs.d && Prefs.flto == null) Prefs.flto = !Prefs.musl && !isTinyCC && !split;
 
     const compilerArgPrefs = [ 'march', 'flto' ];
     const compilerArgs = isTinyCC && process.platform === 'darwin' ?
@@ -116,107 +123,114 @@ export default (code, module = Prefs.module) => {
       [ '-Wl,-stack_size,0x4000000', ...(Prefs.d ? [] : [ '-Wl,-dead_strip', '-Wl,-dead_strip_dylibs', '-Wl,-x' ]) ] :
       [ '-Wl,--gc-sections' ];
     const darwinReleaseCompileArgs = process.platform === 'darwin' && !Prefs.d ? [ '-fvisibility=hidden' ] : [];
+    const compileOnlyArgs = [
+      '-fno-exceptions',
+      '-fno-unwind-tables', '-fno-asynchronous-unwind-tables',
+      '-fno-ident', '-ffunction-sections', '-fdata-sections',
+      ...(cOut.threads ? [ '-pthread' ] : []),
+      ...darwinReleaseCompileArgs,
+      ...compilerArgs,
+      `-O${Prefs.O ?? 3}`
+    ];
+
+    // content-cached units: only changed ones recompile, all of them when porf.h or flags change
+    const compileUnits = (files, cc, cxx = cc) => {
+      const entry = globalThis.file[0] === '/' ? globalThis.file : process.cwd() + '/' + globalThis.file;
+      const buildDir = `${process.env.HOME}/.cache/porffor/build/${hashId(entry)}`;
+      fs.mkdirSync(buildDir, { recursive: true });
+      const stampFile = `${buildDir}/flags`;
+      let stale = !fs.existsSync(stampFile) || fs.readFileSync(stampFile, 'utf8') !== cc + cxx;
+      const changed = [], objects = [];
+      for (const { name, c } of files) {
+        const path = `${buildDir}/${name}`;
+        const same = !stale && fs.existsSync(path) && fs.readFileSync(path, 'utf8') === c;
+        if (!same) fs.writeFileSync(path, c);
+        if (name.endsWith('.h')) { stale ||= !same; continue; }
+        const object = path.replace(/\.c(pp)?$/, '.o');
+        objects.push(object);
+        if (!same || !fs.existsSync(object)) {
+          fs.rmSync(object, { force: true });
+          changed.push(path);
+        }
+      }
+      fs.writeFileSync(stampFile, cc + cxx);
+
+      if (logProgress) progressStart(`compiling ${changed.length}/${objects.length} units (using ${cc.split(' ')[0]})...`);
+      const t5 = performance.now();
+      if (changed.length > 0) {
+        const job = 'case "$0" in *.cpp) exec ' + cxx + ' "$0" -o "${0%.cpp}.o";; *) exec ' + cc + ' "$0" -o "${0%.c}.o";; esac';
+        execSync('xargs -0 -P ' + (Prefs.j ?? '$(getconf _NPROCESSORS_ONLN)') + " -n 1 sh -c '" + job + "'", { input: changed.join('\0'), stdio: [ 'pipe', 'inherit', 'inherit' ] });
+      }
+      if (logProgress) progressDone(`compiled ${changed.length}/${objects.length} units (using ${cc.split(' ')[0]})`, t5);
+      return objects;
+    };
+    const ccUnits = [ ...compiler, '-c', ...compileOnlyArgs ].join(' ');
 
     const compileNativeFetch = () => {
-      const tempDir = fs.mkdtempSync('/tmp/porffor-uws-native-');
-      const objectFile = `${tempDir}/porffor.o`;
-      const shimFile = `${tempDir}/server.cpp`;
+      const uwsDir = uwebsockets.ensureUWebSockets();
+      const uSocketsArchive = uwebsockets.ensureUSocketsBuilt(uwsDir);
+      const cxxArgs = [
+        '-std=c++20',
+        '-DUWS_NO_ZLIB',
+        '-DUWS_HTTPRESPONSE_NO_WRITEMARK',
+        '-I', `${uwsDir}/src`,
+        '-I', `${uwsDir}/uSockets/src`,
+        '-pthread',
+        '-fno-rtti',
+        ...compileOnlyArgs
+      ];
 
-      try {
-        if (logProgress) progressStart(`compiling native fetch code (using ${compiler[0]})...`);
-        let t5 = performance.now();
+      // the shim is largest-first with the units so it never trails the batch
+      const objects = compileUnits([ { name: 'porf_server.cpp', c: uwebsockets.makeUWebSocketsShimSource() }, ...cOut.files ], ccUnits, [ ...cxx, '-c', ...cxxArgs ].join(' '));
 
-        execSync([
-          ...compiler,
-          '-xc', '-', '-c',
-          '-o', objectFile,
-          '-fno-exceptions',
-          '-fno-unwind-tables', '-fno-asynchronous-unwind-tables',
-          '-fno-ident', '-ffunction-sections', '-fdata-sections',
-          ...darwinReleaseCompileArgs,
-          ...compilerArgs,
-          `-O${optPref ?? 3}`
-        ].join(' '), {
-          stdio: [ 'pipe', 'inherit', 'inherit' ],
-          input: c,
-          encoding: 'utf8'
-        });
+      if (logProgress) progressStart(`linking native fetch server (using ${cxx[0]})...`);
+      const t5 = performance.now();
 
-        if (logProgress) progressDone(`compiled native fetch code (using ${compiler[0]})`, t5);
+      const linkArgs = [
+        ...cxx,
+        ...(Prefs.musl ? [ '-static' ] : []),
+        '-o', outFile ?? (process.platform === 'win32' ? 'out.exe' : 'out'),
+        '-pthread',
+        ...compilerArgs,
+        `-O${Prefs.O ?? 3}`,
+        ...linkStripArgs,
+        ...objects,
+        uSocketsArchive,
+        '-lm'
+      ];
+      if (Prefs.s) linkArgs.push('-s');
 
-        if (logProgress) progressStart(`linking native fetch server (using ${cxx[0]})...`);
-        t5 = performance.now();
+      execSync(linkArgs.join(' '), { stdio: 'inherit' });
 
-        const uwsDir = uwebsockets.ensureUWebSockets();
-        const uSocketsArchive = uwebsockets.ensureUSocketsBuilt(uwsDir);
-        fs.writeFileSync(shimFile, uwebsockets.makeUWebSocketsShimSource());
-
-        const linkArgs = [
-          ...cxx,
-          ...(Prefs.musl ? [ '-static' ] : []),
-          '-std=c++20',
-          '-o', outFile ?? (process.platform === 'win32' ? 'out.exe' : 'out'),
-          '-DUWS_NO_ZLIB',
-          '-DUWS_HTTPRESPONSE_NO_WRITEMARK',
-          '-I', `${uwsDir}/src`,
-          '-I', `${uwsDir}/uSockets/src`,
-          '-pthread',
-          '-fno-exceptions',
-          '-fno-rtti',
-          '-fno-unwind-tables', '-fno-asynchronous-unwind-tables',
-          '-fno-ident', '-ffunction-sections', '-fdata-sections',
-          ...darwinReleaseCompileArgs,
-          ...linkStripArgs,
-          ...compilerArgs,
-          `-O${optPref ?? 3}`,
-          shimFile,
-          objectFile,
-          uSocketsArchive,
-          '-lm'
-        ];
-        if (Prefs.s) linkArgs.push('-s');
-
-        execSync(linkArgs.join(' '), { stdio: 'inherit' });
-
-        if (logProgress) progressDone(`linked native fetch server (using ${cxx[0]})`, t5);
-      } finally {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      }
+      if (logProgress) progressDone(`linked native fetch server (using ${cxx[0]})`, t5);
     };
 
     if (Prefs.nativeFetch) {
       compileNativeFetch();
     } else {
+      const objects = split ? compileUnits(cOut.files, ccUnits) : null;
       const args = [
         ...compiler,
         ...(Prefs.musl ? [ '-static' ] : []),
-        '-xc', '-', // use stdin as c source in
+        ...(objects ?? [ '-xc', '-', ...compileOnlyArgs ]),
         '-o', outFile ?? (process.platform === 'win32' ? 'out.exe' : 'out'), // set path for output
-
-        // default cc args, always
         '-lm', // link math.h
-        '-fno-exceptions', // disable exceptions
-        '-fno-unwind-tables', '-fno-asynchronous-unwind-tables',
-        '-fno-ident', '-ffunction-sections', '-fdata-sections', // remove unneeded binary sections
-        ...(cOut.threads ? [ '-pthread' ] : []),
-        ...darwinReleaseCompileArgs,
-        ...(isTinyCC ? [] : linkStripArgs),
-        ...compilerArgs,
-        `-O${optPref ?? 3}`
+        ...(objects ? [ ...(cOut.threads ? [ '-pthread' ] : []), ...compilerArgs, `-O${Prefs.O ?? 3}` ] : []),
+        ...(isTinyCC ? [] : linkStripArgs)
       ];
 
       if (Prefs.s) args.push('-s');
 
-      if (logProgress) progressStart(`compiling C to native (using ${compiler})...`);
+      if (logProgress) progressStart(`${objects ? 'linking' : 'compiling C to'} native (using ${compiler})...`);
       const t5 = performance.now();
 
       execSync(args.join(' '), {
         stdio: [ 'pipe', 'inherit', 'inherit' ],
-        input: c,
+        input: objects ? '' : c,
         encoding: 'utf8'
       });
 
-      if (logProgress) progressDone(`compiled C to native (using ${compiler})`, t5);
+      if (logProgress) progressDone(`${objects ? 'linked' : 'compiled C to'} native (using ${compiler})`, t5);
     }
 
     if (logProgress) {

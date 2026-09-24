@@ -6,7 +6,7 @@ import {
   Load, Store, MemCopy, MemFill,
   If, Loop, Break, Continue, BlockStmt, TypeSwitch, Return, Unreachable,
   Call, CallDynamic, Try, Throw, ThrowNew, Await, Yield,
-  Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC
+  Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC, FuncIdx, FuncRec
 } from './ir.js';
 import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
 import { TYPES, TYPE_FLAGS, TYPE_NAMES } from './types.js';
@@ -191,16 +191,20 @@ const genStmt = (scope, node) => {
 // bytes pushed to `data` are referenced by DataRef(id), render assigns the offsets
 const i32Bytes = x => [ x & 0xff, (x >>> 8) & 0xff, (x >>> 16) & 0xff, (x >>> 24) & 0xff ];
 
-const dataSeg = (key, bytes) => {
+// static data lives in its user's unit so each unit's text is self-contained
+const unitOf = scope => scope.internal ? 'builtins' : scope.unit ?? 'main';
+const dataSeg = (unit, key, bytes) => {
+  if (!modular) unit = 'main';
   if (key != null) {
-    const cached = dataCache.get(key);
+    const cached = dataCache.get(unit + '\0' + key);
     if (cached !== undefined) return cached;
   }
   const id = data.push(bytes) - 1;
-  if (key != null) dataCache.set(key, id);
+  dataUnits[id] = unit;
+  if (key != null) dataCache.set(unit + '\0' + key, id);
   return id;
 };
-const dataRef = (key, bytes) => DataRef(dataSeg(key, bytes));
+const dataRef = (unit, key, bytes) => DataRef(dataSeg(unit, key, bytes));
 
 const isFuncType = type =>
   type === 'FunctionDeclaration' || type === 'FunctionExpression' || type === 'ArrowFunctionExpression' ||
@@ -228,7 +232,7 @@ const useFunctionValue = (func, markReferenced = true) => {
 // function value with no env: one static [fnIdx][0] record per func
 const funcRef = (func, markReferenced = true) => {
   useFunctionValue(func, markReferenced);
-  return valOf(dataRef(`#funcrec:${func.index}`, [ ...i32Bytes(func.index), ...i32Bytes(0) ]), TYPES.function);
+  return valOf(FuncRec(func.index), TYPES.function);
 };
 
 const closureAwareFunc = func =>
@@ -418,7 +422,7 @@ const makeClosureRecord = (scope, func, markReferenced = true) => {
   }
 
   const rec = reuse(scope, Alloc(Const(T.i32, 8), TYPES.function));
-  stmt(scope, Store('u32', rec, 0, Const(T.u32, func.index)));
+  stmt(scope, Store('u32', rec, 0, FuncIdx(func.index)));
   stmt(scope, Store('u32', rec, 4, JvPtr(env)));
   return valOf(rec, TYPES.function);
 };
@@ -431,7 +435,7 @@ const staticFuncIdentity = func =>
 const makeFreshFuncRecord = (scope, func, markReferenced = true) => {
   useFunctionValue(func, markReferenced);
   const rec = reuse(scope, Alloc(Const(T.i32, 8), TYPES.function));
-  stmt(scope, Store('u32', rec, 0, Const(T.u32, func.index)));
+  stmt(scope, Store('u32', rec, 0, FuncIdx(func.index)));
   stmt(scope, Store('u32', rec, 4, Const(T.u32, 0)));
   return valOf(rec, TYPES.function);
 };
@@ -458,7 +462,7 @@ const materializeFunctionValue = (scope, func, markReferenced = true) => {
 
 // one record per activation: shared within it, fresh next call (cache resets to undefined)
 const cachedFunctionValue = (scope, func, markReferenced = true) => {
-  const cache = local(scope, `#func_cache_${func.index}`, T.jsval);
+  const cache = local(scope, `#func_cache_${func.start ?? func.index}`, T.jsval);
   emitIf(scope, Bin('!=', T.i32, JvType(cache), Const(T.i32, TYPES.function)),
     () => assign(scope, cache, makeFunctionValue(scope, func, markReferenced)));
   return cache;
@@ -747,7 +751,7 @@ const builtinShadowed = (scope, name) => {
 const internalThrow = (scope, constructor, message) => {
   message = Prefs.d ? `${message} (in ${scope.name})` : message;
   const msg = message
-    ? dataRef(`#msg:${message}`, [ ...i32Bytes(message.length), ...[...message].map(c => c.charCodeAt(0) & 0xff) ])
+    ? dataRef(unitOf(scope), `#msg:${message}`, [ ...i32Bytes(message.length), ...[...message].map(c => c.charCodeAt(0) & 0xff) ])
     : Const(T.u32, 0);
   const errType = TYPES[constructor.toLowerCase()] ?? TYPES.error;
   typeUsed(scope, errType);
@@ -781,7 +785,7 @@ const lookup = (scope, name, allowImplicitArguments = true, markFunctionReferenc
     return (globals[name].type ?? T.jsval) === T.f64 ? valNumber(global) : global;
   }
 
-  const hoisted = lookupHoistedVar(scope, name);
+  const hoisted = !(name in funcIndex) && lookupHoistedVar(scope, name);
   if (hoisted) return hoisted;
 
   // Porffor.TYPES.x folds to its id
@@ -867,7 +871,7 @@ const generateYield = (scope, decl) => {
       return result;
     }
 
-    const valueName = '#yieldstar' + uniqId();
+    const valueName = '#yieldstar' + uniqId(scope);
     generateForOf(scope, {
       type: 'ForOfStatement',
       left: {
@@ -1189,19 +1193,8 @@ const irBuiltinHelpers = (scope, name, def) => ({
   hasFunc: name => funcIndex[name] != null,
   onFinalize,
   remapData: id => {
-    if (def.funcData && Object.hasOwn(def.funcData, id)) {
-      const f = includeBuiltin(scope, def.funcData[id]);
-      f.indirect = true;
-      return dataSeg(`#funcrec:${f.index}`, [ ...i32Bytes(f.index), ...i32Bytes(0) ]);
-    }
     if (!def.data || !Object.hasOwn(def.data, id)) throw new Error(`${name}: missing precompiled data segment ${id}`);
-    return dataSeg(`builtin:${name}:${id}`, def.data[id]);
-  },
-  remapFuncIndex: idx => {
-    if (!def.funcRefs || !Object.hasOwn(def.funcRefs, idx)) return idx;
-    const f = includeBuiltin(scope, def.funcRefs[idx]);
-    f.indirect = true;
-    return f.index;
+    return dataSeg('builtins', `builtin:${name}:${id}`, def.data[id]);
   },
   remapAllocSite: id => id,
   global: (name, type, init) => {
@@ -2131,7 +2124,7 @@ const unhackName = name => {
   if (!name) return name;
 
   if (name.startsWith('__')) return name.slice(2).replaceAll('_', '.');
-  return name;
+  return name.replace(/(?!^)#m\w+$/, '');
 };
 
 const knownType = (scope, type) => typeof type === 'number' ? type : null;
@@ -2239,7 +2232,7 @@ const allocVar = (scope, name, global = false, valType = T.jsval, redecl = false
   if (name in target) {
     if (redecl) {
       // a redeclaration shadows the old binding: move it aside under a unique name
-      target['#redecl_' + name + uniqId()] = target[name];
+      target['#redecl_' + name + uniqId(scope)] = target[name];
     } else {
       return name;
     }
@@ -2269,26 +2262,28 @@ const addVarMetadata = (scope, name, global = false, metadata = {}) => {
 };
 
 const HOIST_DECL = 1;
-const markVarHoists = (scope, body) => {
+// module let/const: seen by inner functions only, the module body keeps its tdz
+const HOIST_LEXICAL = 2;
+const markVarHoists = (scope, body, moduleTop = false) => {
   scope.hoists ??= new Map();
 
-  const mark = pattern => {
+  const mark = (pattern, kind = HOIST_DECL) => {
     if (!pattern) return;
     const add = name => {
       if (scope.topLevel && name in builtinVars) return;
-      scope.hoists.set(name, HOIST_DECL);
+      scope.hoists.set(name, kind);
     };
     if (typeof pattern === 'string') return void add(pattern);
 
     switch (pattern.type) {
       case 'Identifier': return void add(pattern.name);
-      case 'AssignmentPattern': return mark(pattern.left);
-      case 'RestElement': return mark(pattern.argument);
+      case 'AssignmentPattern': return mark(pattern.left, kind);
+      case 'RestElement': return mark(pattern.argument, kind);
       case 'ArrayPattern':
-        for (const x of pattern.elements) mark(x);
+        for (const x of pattern.elements) mark(x, kind);
         return;
       case 'ObjectPattern':
-        for (const x of pattern.properties) mark(x.type === 'RestElement' ? x.argument : x.value);
+        for (const x of pattern.properties) mark(x.type === 'RestElement' ? x.argument : x.value, kind);
         return;
     }
   };
@@ -2318,7 +2313,12 @@ const markVarHoists = (scope, body) => {
   };
 
   const stmts = body.type === 'Program' || body.type === 'BlockStatement' ? body.body : null;
-  if (stmts) for (const x of stmts) scan(x);
+  if (stmts) for (const x of stmts) {
+    if (moduleTop && x.type === 'VariableDeclaration' && x.kind !== 'var') {
+      for (const d of x.declarations) mark(d.id, HOIST_LEXICAL);
+    }
+    scan(x);
+  }
 };
 
 const materializeHoistedVar = (scope, name) => {
@@ -2331,7 +2331,7 @@ const lookupHoistedVar = (scope, name) => {
   if (scope.hoists?.get(name) === HOIST_DECL) return materializeHoistedVar(scope, name);
 
   for (let cursor = scope.parentFunc; cursor; cursor = cursor.parentFunc) {
-    if (cursor.topLevel && cursor.hoists?.get(name) === HOIST_DECL) return materializeHoistedVar(cursor, name);
+    if (cursor.topLevel && cursor.hoists?.has(name)) return materializeHoistedVar(cursor, name);
   }
 };
 
@@ -2444,7 +2444,7 @@ const setDefaultFuncName = (decl, name) => {
 };
 
 const generatePatternDstr = (scope, tmpPrefix, pattern, init, defaultValue, emit) => {
-  const tmpName = tmpPrefix + uniqId();
+  const tmpName = tmpPrefix + uniqId(scope);
   generateVarDstr(scope, 'const', tmpName, init, defaultValue, false);
 
   const tmpRef = Local(tmpName, scope.locals[tmpName]?.type ?? T.jsval);
@@ -2536,12 +2536,14 @@ const generateVarDstr = (scope, kind, pattern, init, defaultValue, global) => {
         delete funcIndex[funcName];
       }
 
-      if (directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {
+      // an earlier-generated function already read the hoisted global
+      const hoistRead = global && name in globals;
+      if (!hoistRead && directCallOnlyFunctionBinding(scope, kind, name, pattern, func)) {
         return valUndefined();
       }
 
       // var/let function exprs need their binding value immediately (e.g. constructor .prototype reads), const stays lazy
-      if (kind !== 'const' || hasClosureCaptures(func) || scope.closureOwnLocals?.[name]) {
+      if (kind !== 'const' || hoistRead || hasClosureCaptures(func) || scope.closureOwnLocals?.[name]) {
         allocVar(scope, name, global);
         setVarMetadata(scope, name, global, { kind });
         setLocalWithType(scope, name, global, materializeFunctionValue(scope, func), false, TYPES.function);
@@ -2663,7 +2665,7 @@ const generatePatternAssign = (scope, pattern, init, defaultValue) => {
 
   if (pattern.type === 'MemberExpression' && init?.type === 'MemberExpression') {
     // a.b = c.d: bind source key, target object and property up-front for evaluation order
-    const id = uniqId();
+    const id = uniqId(scope);
     const sourceKeyName = '#assign_source_key' + id;
     const targetObjectName = '#assign_target_obj' + id;
     const targetPropertyName = '#assign_target_prop' + id;
@@ -2691,7 +2693,7 @@ const generatePatternAssign = (scope, pattern, init, defaultValue) => {
     let right = init;
 
     if (defaultValue) {
-      const tmpName = '#assign' + uniqId();
+      const tmpName = '#assign' + uniqId(scope);
       generateVarDstr(scope, 'const', tmpName, init, undefined, false);
       right = {
         type: 'ConditionalExpression',
@@ -2783,7 +2785,7 @@ const globalThisBindingName = decl => {
 };
 
 const bindMemberTarget = (scope, member, prefix, coerceKey = false) => {
-  const id = uniqId();
+  const id = uniqId(scope);
   const objName = prefix + 'obj' + id;
   generateVarDstr(scope, 'const', objName, member.object, undefined, false);
 
@@ -3088,7 +3090,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
   }
 
   if ((type === 'ArrayPattern' || type === 'ObjectPattern') && op === '=') {
-    const tmpName = '#rhs' + uniqId();
+    const tmpName = '#rhs' + uniqId(scope);
     generateVarDstr(scope, 'const', tmpName, decl.right, undefined, false);
     generatePatternAssign(scope, decl.left, identNode(tmpName));
     return valueUnused ? valUndefined() : generate(scope, identNode(tmpName));
@@ -3107,7 +3109,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     if (!isIdentAssignable(scope, name, op)) return internalThrow(scope, 'ReferenceError', `${unhackName(name)} is not defined`);
 
     if (type !== 'Identifier') {
-      const tmpName = '#rhs' + uniqId();
+      const tmpName = '#rhs' + uniqId(scope);
       generateVarDstr(scope, 'const', tmpName, decl.right, undefined, true);
       generateVarDstr(scope, 'var', decl.left, identNode(tmpName), undefined, true);
       return generate(scope, identNode(tmpName));
@@ -3676,7 +3678,7 @@ const generateSwitch = (scope, decl) => {
     }
   }
 
-  const discName = '#switch' + uniqId();
+  const discName = '#switch' + uniqId(scope);
   allocVar(scope, discName, false);
   setLocalWithType(scope, discName, false, decl.discriminant);
 
@@ -3784,7 +3786,7 @@ const generateThrow = (scope, decl) => {
     if (constructor && (arg == null || arg.value != null)) {
       const message = arg == null ? '' : String(arg.value);
       const msg = message
-        ? dataRef(`#msg:${message}`, [ ...i32Bytes(message.length), ...[...message].map(c => c.charCodeAt(0) & 0xff) ])
+        ? dataRef(unitOf(scope), `#msg:${message}`, [ ...i32Bytes(message.length), ...[...message].map(c => c.charCodeAt(0) & 0xff) ])
         : Const(T.u32, 0);
       stmt(scope, ThrowNew(TYPES[constructor.toLowerCase()] ?? TYPES.error, msg));
       return;
@@ -3897,7 +3899,7 @@ const makeString = (scope, str, bytestring = true) => {
     if (!bytestring) bytes.push((c >>> 8) & 0xff);
   }
 
-  return valOf(dataRef(`#str:${bytestring ? 'b' : 's'}:${str}`, bytes), bytestring ? TYPES.bytestring : TYPES.string);
+  return valOf(dataRef(unitOf(scope), `#str:${bytestring ? 'b' : 's'}:${str}`, bytes), bytestring ? TYPES.bytestring : TYPES.string);
 };
 
 const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) => {
@@ -3910,8 +3912,8 @@ const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) =
   let pointer;
   const isStatic = staticAlloc || decl._staticAlloc;
   if (isStatic) {
-    const uniqueName = name === '$undeclared' ? name + uniqId() : name;
-    pointer = dataRef(`#staticarr:${uniqueName}`, new Array(allocSize).fill(0));
+    const uniqueName = name === '$undeclared' ? name + uniqId(scope) : name;
+    pointer = dataRef(unitOf(scope), `#staticarr:${uniqueName}`, new Array(allocSize).fill(0));
   } else {
     pointer = reuse(scope, Alloc(Const(T.i32, allocSize), TYPES.array));
   }
@@ -4086,7 +4088,7 @@ const resolveMemberDemands = scope => {
   }
 };
 
-let icSite, icChunk;
+let icSites;
 
 const generateMember = (scope, decl, objValue = null) => {
   if (!globalThis.precompile) demandMemberRead(decl);
@@ -4151,11 +4153,13 @@ const generateMember = (scope, decl, objValue = null) => {
     if (hash == null) return builtinCall(scope, '__Porffor_object_get', [ obj, key ]);
 
     if (Prefs.ic && (known == null || known === TYPES.object)) {
-      const index = icSite++ % 256;
+      const unit = unitOf(scope);
+      const ic = icSites[unit] ??= { site: 0, chunk: null };
+      const index = ic.site++ % 256;
       if (index === 0)
-        icChunk = dataSeg(`#ic:${icSite}`, new Array(256).fill(i32Bytes(0x7fffffff)).flat());
+        ic.chunk = dataSeg(unit, `#ic:${unit}:${ic.site}`, new Array(256).fill(i32Bytes(0x7fffffff)).flat());
 
-      const chunk = DataRef(icChunk);
+      const chunk = DataRef(ic.chunk);
       const slot = index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 4));
       return builtinCall(scope, '__Porffor_object_get_ic', [ obj, key, Const(T.i32, hash), slot ]);
     }
@@ -4323,7 +4327,7 @@ const generateClass = (scope, decl) => {
     return valUndefined();
   }
 
-  if (!decl.id) decl.id = { type: 'Identifier', name: `#${globalThis.precompile ? 'builtin_' : ''}anonymous${uniqId()}` };
+  if (!decl.id) decl.id = { type: 'Identifier', name: anonymousName(decl) };
   const name = decl.id.name;
 
   const body = decl.body.body;
@@ -4420,7 +4424,7 @@ const generateClass = (scope, decl) => {
     if (type === 'PropertyDefinition' && !_static) {
       let keyNode;
       if (computed) {
-        const keyGlobal = '#class_computed_prop' + uniqId();
+        const keyGlobal = `#class_computed_prop${scope.start ?? scope.index}` + uniqId(scope);
         allocVar(scope, keyGlobal, true);
         assign(scope, Global(keyGlobal, T.jsval), toPropertyKey(scope, generate(scope, key), true));
         keyNode = () => Global(keyGlobal, T.jsval);
@@ -4545,8 +4549,10 @@ const generateTaggedTemplate = (scope, decl) => {
   });
 };
 
-globalThis._uniqId = 0;
-const uniqId = () => '_' + globalThis._uniqId++;
+// anonymous functions are named by source position so a unit's text is stable
+let anonymousId = 0;
+const anonymousName = decl => globalThis.precompile || decl.start == null ? `#${globalThis.precompile ? 'builtin_' : ''}anonymous${anonymousId++}` : `#anonymous_${decl.start}`;
+const uniqId = scope => '_' + (scope.uniqId = (scope.uniqId ?? 0) + 1);
 let objectHackers = [], allObjectHackers = [];
 const objectHack = node => {
   if (!node) return node;
@@ -4661,7 +4667,7 @@ const onFinalize = fn => { (irFinalizers ??= []).push(fn); };
 const generateFunc = (scope, decl, forceNoExpr = false) => {
   doNotMarkFuncRef = false;
 
-  if (!decl.id) decl.id = { type: 'Identifier', name: `#${globalThis.precompile ? 'builtin_' : ''}anonymous${uniqId()}` };
+  if (!decl.id) decl.id = { type: 'Identifier', name: anonymousName(decl) };
   const name = decl.id.name;
   const topLevel = !!decl._topLevel || decl.type === 'Program';
   const directCallOnly =
@@ -4692,6 +4698,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
     strict: scope.strict || decl.strict,
     usesArguments: decl._usesArguments,
     ast: decl,
+    unit: decl._unit ?? scope.unit,
     parentFunc: scope.name ? scope : null,
     selfAware: !!decl._selfAware,
     directCallOnly,
@@ -4733,7 +4740,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         globalThis.funcBodies[name] = body;
       }
 
-      markVarHoists(func, body);
+      markVarHoists(func, body, !!decl._module);
 
       // pick numeric var storage before emitting refs
       if (!func.topLevel) {
@@ -4746,8 +4753,9 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
         }
       }
 
-      // hoist function decls so earlier calls stay direct
-      if (body.type === 'BlockStatement') {
+      // hoist function decls so earlier calls stay direct (module inits hoist their own)
+      const moduleInits = decl.type === 'Program' && !decl._module && body.body.some(x => x._unit != null);
+      if (body.type === 'BlockStatement' && !moduleInits) {
         let b = body.body, j = 0;
         if (b[0]?.directive) j++;
         for (let i = 0; i < b.length; i++) {
@@ -4844,9 +4852,10 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
 
       if (decl._baseClassFieldInit) stmt(func, CLASS_FIELD_INIT_MARKER);
 
-      genStmt(func, body);
+      if (moduleInits) generateModules(func, body.body);
+      else genStmt(func, body);
 
-      if (func.topLevel) {
+      if (func.topLevel && !decl._module) {
         func.export = true;
 
         // drain the microtask queue at program end when promises exist
@@ -4865,7 +4874,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
 
   if (!decl._method && !decl._noFuncIndex) setFuncIndex(name, func.index);
   if (decl.type === 'FunctionDeclaration') bindNamedFunction(scope, name, func);
-  if (func.topLevel) topLevelFunc = func;
+  if (func.topLevel && !decl._module) topLevelFunc = func;
   funcs.push(func);
   funcsByIndex[func.index] = func;
 
@@ -4955,6 +4964,23 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
   const out = decl.type.endsWith('Expression') && !forceNoExpr ? materializeFunctionExpr(scope, func) : valUndefined();
   doNotMarkFuncRef = false;
   return [ func, out ];
+};
+
+// each module's top level becomes an init function in its unit, unitless statements stay in #main
+const generateModules = (scope, body) => {
+  let unit = null, group = [];
+  const flush = () => {
+    if (group.length === 0) return;
+    const [ func ] = generateFunc(scope, { type: 'Program', id: { name: `#mod_${unit}` }, _module: true, _unit: unit, strict: scope.strict, body: { type: 'BlockStatement', body: group } });
+    exprStmt(scope, Call(func.index, [], T.none));
+    group = [];
+  };
+  for (const x of body) {
+    if (x._unit == null) { flush(); genStmt(scope, x); continue; }
+    if (x._unit !== unit) { flush(); unit = x._unit; }
+    group.push(x);
+  }
+  flush();
 };
 
 const generateBlock = (scope, decl) => {
@@ -5081,7 +5107,7 @@ const inferDirectCallParamTypes = root => {
   }
 };
 
-let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataCache, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
+let globals, funcs, funcsByIndex, funcIndex, funcNameCollisions, currentFuncIndex, depth, data, dataUnits, dataCache, modular, rawHead, builtinGlobalInits, includedBuiltinGlobalInits, usedTypes, globalInfer, builtinFuncs, builtinVars, builtinPrototypeFuncs, builtinPrototypeGetters, builtinPrototypeObjectGetters, topLevelFunc;
 
 export default (program, opts = {}) => {
   const entryName = opts.entryName ?? '#main';
@@ -5092,7 +5118,9 @@ export default (program, opts = {}) => {
   funcNameCollisions = Object.create(null);
   depth = [];
   data = [];
+  dataUnits = [];
   dataCache = new Map();
+  modular = !!program._units;
   rawHead = [];
   builtinGlobalInits = [];
   includedBuiltinGlobalInits = new Set();
@@ -5102,8 +5130,7 @@ export default (program, opts = {}) => {
   topLevelFunc = null;
   onFinalize(() => resolveMemberDemands(topLevelFunc));
   currentFuncIndex = 0;
-  icSite = 0;
-  icChunk = null;
+  icSites = Object.create(null);
   usedTypes = new Set([ TYPES.undefined, TYPES.number, TYPES.boolean, TYPES.function ]);
   globalInfer = Object.create(null);
 
@@ -5149,7 +5176,9 @@ export default (program, opts = {}) => {
     semantic.objectHackers = objectHackers;
   }
   if (program._usesTemporal) {
-    program.body = parse(temporalPolyfillSource).body.concat(program.body);
+    const polyfill = parse(temporalPolyfillSource).body;
+    if (program._units) for (const x of polyfill) x._unit = 'temporal';
+    program.body = polyfill.concat(program.body);
   }
 
   // todo/perf: make this lazy per func (again)
@@ -5229,6 +5258,8 @@ export default (program, opts = {}) => {
   return {
     funcs: renderFuncs,
     data,
+    dataUnits,
+    units: program._units ?? null,
     globals: renderGlobals,
     entry: entryName,
     prefs: rawHead.length ? { ...Prefs, rawHead: [ Prefs.rawHead, ...rawHead ].filter(Boolean).join('\n') } : Prefs,

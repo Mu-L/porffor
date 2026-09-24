@@ -114,7 +114,9 @@ export const K = {
   RawC: k++,     // a: code string, b: semi bool
   Reserved: k++,
   JvFalsy: k++,  // a: jsval -> i32
-  JvNullish: k++ // a: jsval -> i32
+  JvNullish: k++,// a: jsval -> i32
+  FuncIdx: k++,  // a: func ref -> u32 link index
+  FuncRec: k++   // a: func ref -> ptr to its static record
 };
 
 export const KNames = [];
@@ -377,5 +379,7 @@ export const LenSet = (ptr, len) => [K.LenSet, T.none, fxOf(ptr) | fxOf(len) | F
 
 // escape hatches
 export const RawC = (code, semi = true) => [K.RawC, T.none, FX.call, code, semi, 0];
+export const FuncIdx = func => [K.FuncIdx, T.u32, FX.none, func, 0, 0];
+export const FuncRec = func => [K.FuncRec, T.ptr, FX.none, func, 0, 0];
 
 export const FN_ASYNC = 1, FN_GENERATOR = 2, FN_ASYNC_GENERATOR = 4;
