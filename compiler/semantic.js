@@ -581,7 +581,7 @@ const annotate = (node, parent = null, key = null) => {
           node._noStorageInfer = true;
           variable.node._storageHazardRef = true;
         }
-        if (parent?.type === 'CallExpression' && key === 'callee' && !parent.optional) {
+        if (parent?.type === 'CallExpression' && key === 'callee' && !parent.optional && !parent.arguments.some(x => x?.type === 'SpreadElement')) {
           variable.node._directCallRefs = (variable.node._directCallRefs ?? 0) + 1;
           // eval bodies are compiled without direct param type inference
           if (!inEval) {
