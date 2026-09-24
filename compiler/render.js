@@ -927,9 +927,7 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
         if (/underlyingStore$/.test(g.name)) {
           const buckets = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBuckets'));
           const bucketsCap = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBucketsCap'));
-          markGlobalRawLines.push(`  porf_gc_mark_underlying_store((i32)${name});`);
-          markGlobalRawLines.push(`  ${buckets} = 0;`);
-          markGlobalRawLines.push(`  ${bucketsCap} = 0;`);
+          markGlobalRawLines.push(`  if (porf_gc_mark_underlying_store((i32)${name})) { ${buckets} = 0; ${bucketsCap} = 0; }`);
         }
         else if (/underlyingBuckets$/.test(g.name)) markGlobalRawLines.push(`  porf_gc_mark_raw((i32)${name});`);
         else if (/__Porffor_regex_cache$/.test(g.name)) markGlobalRawLines.push(`  porf_gc_mark_regex_cache((i32)${name});`);
@@ -1780,7 +1778,8 @@ ${st}void porf_gc_collect_impl(int minor);
 ${usesThreads ? 'static void porf_gc_collect_threaded(int minor);\n' : ''}\
 static void porf_gc_mark_js(f64 value, i32 type);
 static void porf_gc_mark_raw(i32 body);
-static void porf_gc_mark_underlying_store(i32 body);
+static int porf_gc_mark_underlying_store(i32 body);
+static u32 porf_gc_underlying_old = 0;
 static void porf_gc_mark_regex_cache(i32 cache);
 static void porf_gc_mark_coro_handle(uintptr_t raw);
 static void porf_gc_finalize_body(i32 body, i32 type);
@@ -2962,16 +2961,28 @@ static void porf_gc_scan_underlying_store(i32 body) {
   }
 }
 
-static void porf_gc_mark_underlying_store(i32 body) {
-  if (!porf_gc_is_block_start(body)) return;
+// minors skip the promoted prefix (entries are in creation order), returns whether entries were removed
+static int porf_gc_mark_underlying_store(i32 body) {
+  if (!porf_gc_is_block_start(body)) return 1;
   porf_gc_mark_body(body);
   porf_gc_set_kind(body, PORF_GC_KIND_UNDERLYING_STORE);
 
   const u32 len = *(u32*)(MEM + body);
+  u32 start = 0;
+  if (porf_gc_minor_mode) {
+    u32 p = porf_gc_underlying_old <= len ? porf_gc_underlying_old : 0u;
+    while (p < len) {
+      const i32 underlying = *(u32*)(MEM + body + 8 + (i32)(p * 16u) + 8);
+      if (underlying <= 0 || porf_gc_bit(PORF_GC_B_YOUNG, porf_gc_gran(underlying)) != 0u) break;
+      p++;
+    }
+    porf_gc_underlying_old = p;
+    start = p;
+  }
   int changed;
   do {
     changed = 0;
-    for (u32 i = 0; i < len; i++) {
+    for (u32 i = start; i < len; i++) {
       const i32 base = body + 8 + (i32)(i * 16u);
       const jsval original = porf_unpack(*(jsbits*)(MEM + base));
       const i32 underlying = *(u32*)(MEM + base + 8);
@@ -2987,8 +2998,8 @@ static void porf_gc_mark_underlying_store(i32 body) {
     if (changed) porf_gc_drain_mark_queue();
   } while (changed);
 
-  u32 out = 0;
-  for (u32 i = 0; i < len; i++) {
+  u32 out = start;
+  for (u32 i = start; i < len; i++) {
     const i32 base = body + 8 + (i32)(i * 16u);
     const jsval original = porf_unpack(*(jsbits*)(MEM + base));
     if (!porf_gc_in_static(porf_gc_value_body(original.val, original.type)) && !porf_gc_is_marked_js(original.val, original.type)) continue;
@@ -3004,6 +3015,9 @@ static void porf_gc_mark_underlying_store(i32 body) {
   }
 
   *(u32*)(MEM + body) = out;
+  // every survivor of a major collection is promoted by its sweep
+  if (!porf_gc_minor_mode) porf_gc_underlying_old = out;
+  return out != len;
 }
 
 static void porf_gc_scan_regex_cache(i32 cache) {
