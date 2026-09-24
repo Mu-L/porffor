@@ -4827,7 +4827,7 @@ const generateFunc = (scope, decl, forceNoExpr = false) => {
           const ref = Local(argName, func.locals[argName]?.type ?? T.jsval);
           if (ref[N_TYPE] === T.jsval) emitIf(func, Bin('==', T.i32, JvType(ref), Const(T.i32, TYPES.undefined)), () => {
             const known = getNodeType(func, def);
-            const value = generate(func, def, false, argName);
+            const value = generate(func, def, argName);
             assign(func, ref, value[N_TYPE] === T.jsval ? value : known != null && known !== TYPES.number ? valOf(value, known) : valNumber(value));
           });
         }
