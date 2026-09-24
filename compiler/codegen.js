@@ -615,7 +615,7 @@ const generate = (scope, decl, name = undefined, valueUnused = false) => {
 
           const func = resolveNamedFunction(scope, local);
           if (!func || func.internal) {
-            return internalThrow(scope, 'Error', `porffor: unsupported export '${local}'`, true);
+            return internalThrow(scope, 'Error', `porffor: unsupported export '${local}'`);
           }
 
           func.export = true;
@@ -673,7 +673,7 @@ const generate = (scope, decl, name = undefined, valueUnused = false) => {
         return valUndefined();
       }
 
-      return internalThrow(scope, 'Error', `porffor: no generation for ${decl.type}`, true);
+      return internalThrow(scope, 'Error', `porffor: no generation for ${decl.type}`);
   }
 };
 
@@ -2853,7 +2853,7 @@ const ctHash = prop => {
 
 const generateAssign = (scope, decl, valueUnused = false) => {
   if (decl.left.type === 'Identifier' && decl.left._selfBinding) {
-    if (scope.strict || decl.left._classBinding) return internalThrow(scope, 'TypeError', `Cannot assign to constant variable ${decl.left.name}`, true);
+    if (scope.strict || decl.left._classBinding) return internalThrow(scope, 'TypeError', `Cannot assign to constant variable ${decl.left.name}`);
 
     const v = generate(scope, decl.right);
     if (valueUnused) { exprStmt(scope, v); return valUndefined(); }
@@ -3104,7 +3104,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     }
 
     // only allow = for this, or if in strict mode always throw
-    if (!isIdentAssignable(scope, name, op)) return internalThrow(scope, 'ReferenceError', `${unhackName(name)} is not defined`, true);
+    if (!isIdentAssignable(scope, name, op)) return internalThrow(scope, 'ReferenceError', `${unhackName(name)} is not defined`);
 
     if (type !== 'Identifier') {
       const tmpName = '#rhs' + uniqId();
@@ -3114,7 +3114,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     }
 
     if (name in builtinVars) {
-      if (scope.strict) return internalThrow(scope, 'TypeError', `Cannot assign to non-writable global ${name}`, true);
+      if (scope.strict) return internalThrow(scope, 'TypeError', `Cannot assign to non-writable global ${name}`);
 
       // just return rhs (eg `NaN = 2`)
       return generate(scope, decl.right);
@@ -3125,7 +3125,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     return valueUnused ? valUndefined() : generate(scope, decl.left);
   }
 
-  if (local.metadata?.kind === 'const') return internalThrow(scope, 'TypeError', `Cannot assign to constant variable ${name}`, true);
+  if (local.metadata?.kind === 'const') return internalThrow(scope, 'TypeError', `Cannot assign to constant variable ${name}`);
 
   if (op === '=') {
     if (valueUnused) { setLocalWithType(scope, name, isGlobal, decl.right); return valUndefined(); }
@@ -3190,7 +3190,7 @@ const generateUnary = (scope, decl) => {
     case 'delete': {
       if (decl.argument.type === 'MemberExpression') {
         const object = decl.argument.object;
-        if (object.type === 'Super') return internalThrow(scope, 'ReferenceError', 'Cannot delete super property', true);
+        if (object.type === 'Super') return internalThrow(scope, 'ReferenceError', 'Cannot delete super property');
 
         const property = getProperty(decl.argument);
         const obj = reuse(scope, generate(scope, object));
